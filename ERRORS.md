@@ -14,6 +14,16 @@
 
 ## 🛠 Зафиксированные ошибки и решения:
 
+### [2026-08-22] Обход антибот-системы DataDome на Etix через AdsPower Local API и CDP
+- **Контекст / Ошибка:** Etix блокировал скрипт чекера страницей "Access Temporarily Blocked" и слайдер-капчей "Slide right to secure your access".
+- **Причина:** Стандартный Playwright оставляет утечки автоматизации (CDP runtime, `navigator.webdriver`, неконсистентные TLS/WebRTC/Timezone фингерпринты), а временные "стерильные" контексты мгновенно вычисляются DataDome.
+- **Решение:** Полный переход на AdsPower Local API с пулом постоянных профилей SunBrowser (правило: 1 профиль = 1 постоянный прокси со строгим совпадением таймзоны, языка, отключенным WebRTC и аппаратными фингерпринтами). Playwright подключается по протоколу WebSocket CDP (`connect_over_cdp`), обеспечивая стабильную проходимость без блокировок.
+
+### [2026-08-22] Windows Console UnicodeEncodeError в CLI и тестах
+- **Контекст / Ошибка:** `UnicodeEncodeError: 'charmap' codec can't encode character '\U0001f9ea'` при выводе логов/эмодзи в терминале Windows.
+- **Причина:** Дефолтная кодировка `sys.stdout` в Windows PowerShell/CMD — `cp1251`, не поддерживающая 4-байтные UTF-8 символы.
+- **Решение:** Вызов `sys.stdout.reconfigure(encoding="utf-8")` при старте скриптов и использование библиотеки `rich` для безопасного форматированного вывода.
+
 ### [2026-08-21] Безопасное обновление Inline-сообщений Telegram (aiogram 3.x)
 - **Контекст / Ошибка:** При повторном клике на Inline-кнопку без изменения текста или клавиатуры aiogram выбрасывает `TelegramBadRequest: Bad Request: message is not modified`.
 - **Причина:** Telegram Bot API запрещает редактировать сообщение, если новое содержимое и разметка полностью идентичны текущим.
