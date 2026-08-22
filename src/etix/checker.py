@@ -134,13 +134,27 @@ class EtixCheckEngine:
                 f"No profiles found in AdsPower group '{self.config.adspower_group_name}'!"
             )
 
-        # Initialize CDP Browser Pool
+        # Calculate maximum workers needed across all shows in this run
+        max_needed_workers = 1
+        for s in shows:
+            limit = s.max_per_order if s.max_per_order and s.max_per_order > 0 else 1
+            needed_for_show = math.ceil(s.target_total / limit)
+            if needed_for_show > max_needed_workers:
+                max_needed_workers = needed_for_show
+
+        profiles_count_to_start = min(max_needed_workers, self.config.active_profiles_count)
+        LOGGER.info(
+            f"Calculated maximum needed profiles for run: {profiles_count_to_start} "
+            f"(target max: {max_needed_workers}, active pool limit: {self.config.active_profiles_count})"
+        )
+
+        # Initialize CDP Browser Pool with only needed profiles
         self.cdp_pool = CDPBrowserPool(
             config=self.config,
             client=self.client,
             profile_manager=self.profile_manager,
         )
-        workers = await self.cdp_pool.initialize()
+        workers = await self.cdp_pool.initialize(count_needed=profiles_count_to_start)
         if not workers:
             raise RuntimeError("Failed to connect to any AdsPower browser workers via CDP!")
 
@@ -287,8 +301,11 @@ class EtixCheckEngine:
             max_per_order = 1
 
         # Calculate required workers
-        required_workers_count = math.ceil(show.target_total / max_per_order)
-        selected_workers = workers[: min(required_workers_count, len(workers))]
+        required_workers_count = min(math.ceil(show.target_total / max_per_order), len(workers))
+        other_workers = [w for w in workers if w != primary_worker]
+        needed_others = max(0, required_workers_count - 1)
+        selected_others = random.sample(other_workers, min(needed_others, len(other_workers)))
+        selected_workers = [primary_worker] + selected_others
 
         LOGGER.info(
             f"Using {len(selected_workers)} workers (Limit per order: {max_per_order}, Target: {show.target_total})"

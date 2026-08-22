@@ -17,7 +17,6 @@ class EtixDetector:
 
     async def is_soldout_page(self, page: Page) -> bool:
         """Check whether the page indicates the event is Sold Out."""
-        # 1. Selector check
         for selector in self.config.sold_out_banner_selectors:
             try:
                 locator = page.locator(selector).first
@@ -26,7 +25,6 @@ class EtixDetector:
             except Exception:
                 continue
 
-        # 2. Text patterns check
         try:
             body_text = await page.inner_text("body", timeout=1500)
             for pattern in self.config.sold_out_text_patterns:
@@ -89,10 +87,13 @@ class EtixDetector:
     async def is_cart_page(self, page: Page) -> bool:
         """Check whether page navigated to Shopping Cart / Review step."""
         url = page.url.lower()
-        if "/cart" in url or "/checkout" in url or "/review" in url:
+        cart_keywords = ["cart", "shoppingcart", "viewshoppingcart", "checkout", "review", "basket"]
+        if any(k in url for k in cart_keywords):
             return True
         try:
-            has_cart_elem = await page.locator(".cart-item, #cart-container, .order-summary").first.is_visible(timeout=500)
+            has_cart_elem = await page.locator(
+                ".cart-item, #cart-container, .order-summary, table.cart, #shopping-cart, .shoppingCart"
+            ).first.is_visible(timeout=500)
             return bool(has_cart_elem)
         except Exception:
             return False

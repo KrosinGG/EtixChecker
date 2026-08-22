@@ -1,10 +1,10 @@
-"""Etix cart handler for quantity selection, cart addition, and release."""
+"""Etix cart handler supporting both Material-UI custom comboboxes and standard select elements."""
 
 from __future__ import annotations
 
 import asyncio
 import re
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 from playwright.async_api import Page, Locator
 
 from src.browser.human_actions import human_sleep
@@ -14,11 +14,53 @@ from src.utils.logger import LOGGER
 
 
 class EtixCartHandler:
-    """Handles ticket selection, cart addition, and cart cleanup."""
+    """Handles ticket selection, cart addition, and cart cleanup for both MUI and classic Etix forms."""
 
     def __init__(self, config: AppConfig, detector: EtixDetector) -> None:
         self.config = config
         self.detector = detector
+
+    async def get_all_quantity_controls(self, page: Page) -> List[Locator]:
+        """
+        Find all ticket quantity controls on page.
+        Supports Material-UI comboboxes and standard select elements.
+        """
+        try:
+            await page.wait_for_selector(
+                "[role='combobox'], .MuiSelect-select, .smoketest-ticket-quantity, select",
+                timeout=12000,
+            )
+        except Exception:
+            pass
+
+        # 1. Search for Material-UI comboboxes
+        mui_combos = page.locator("[role='combobox'], .MuiSelect-select")
+        count = await mui_combos.count()
+        candidates: List[Locator] = []
+
+        for i in range(count):
+            loc = mui_combos.nth(i)
+            try:
+                if await loc.is_visible(timeout=500):
+                    candidates.append(loc)
+            except Exception:
+                continue
+
+        if candidates:
+            return candidates
+
+        # 2. Search for standard select tags
+        selects = page.locator("select")
+        count = await selects.count()
+        for i in range(count):
+            loc = selects.nth(i)
+            try:
+                if await loc.is_visible(timeout=500):
+                    candidates.append(loc)
+            except Exception:
+                continue
+
+        return candidates
 
     async def find_ticket_select(
         self,
@@ -26,47 +68,25 @@ class EtixCartHandler:
         ticket_index: Optional[int] = None,
     ) -> Optional[Locator]:
         """
-        Find the appropriate ticket quantity select dropdown.
-        Supports 1-based ticket_index (e.g. 1 = 1st ticket type, 2 = 2nd ticket type).
+        Find target ticket quantity selector.
+        Supports 1-based ticket_index (1 = 1st ticket type, 2 = 2nd ticket type).
         """
-        # Wait up to 12s for select elements to be dynamically rendered by Etix JS
-        try:
-            await page.wait_for_selector("select", timeout=12000)
-        except Exception:
-            pass
-
-        selects = page.locator("select")
-        count = await selects.count()
-        if count == 0:
+        candidates = await self.get_all_quantity_controls(page)
+        if not candidates:
             return None
 
-        # Filter to visible select elements
-        candidates = []
-        for i in range(count):
-            sel = selects.nth(i)
-            try:
-                if await sel.is_visible(timeout=500):
-                    candidates.append(sel)
-            except Exception:
-                continue
-
-        if not candidates:
-            # Fallback to first select in DOM if visibility check was too strict
-            return selects.first
-
-        # Handle 1-based ticket_index (e.g. ticket_index=1 -> index 0, ticket_index=2 -> index 1)
+        # 1-based indexing
         if ticket_index is not None and candidates:
             if ticket_index > 0:
                 idx = ticket_index - 1
             else:
-                idx = ticket_index  # e.g. -1 for last select
+                idx = ticket_index  # negative index e.g. -1 for last
 
             if 0 <= idx < len(candidates):
                 return candidates[idx]
 
-            # If index is out of bounds, pick the closest available (e.g. last select)
             LOGGER.warning(
-                f"ticket_index {ticket_index} exceeds available selects ({len(candidates)}). Using select at index {len(candidates)-1}."
+                f"ticket_index {ticket_index} out of bounds (found {len(candidates)}). Using index {len(candidates)-1}."
             )
             return candidates[-1]
 
@@ -77,60 +97,111 @@ class EtixCartHandler:
         page: Page,
         ticket_index: Optional[int] = None,
     ) -> int:
-        """Detect max quantity per order from select options."""
-        sel = await self.find_ticket_select(page, ticket_index)
-        if not sel:
-            return 1
+        """Detect max quantity per order from page text or options."""
+        # 1. Check for text pattern on page: "Limit X tickets per order"
         try:
-            options = await sel.locator("option").all_inner_texts()
-            vals = []
-            for opt in options:
-                opt_str = opt.strip()
-                if opt_str.isdigit():
-                    vals.append(int(opt_str))
-            if vals:
-                return max(vals)
+            body_text = await page.inner_text("body", timeout=1500)
+            m = re.search(r"Limit\s+(\d+)\s+tickets?\s+per\s+order", body_text, re.I)
+            if m:
+                return int(m.group(1))
         except Exception:
             pass
-        return 1
+
+        # 2. Check options of standard select if present
+        sel = await self.find_ticket_select(page, ticket_index)
+        if not sel:
+            return 4
+
+        try:
+            tag_name = await sel.evaluate("el => el.tagName.toLowerCase()")
+            if tag_name == "select":
+                options = await sel.locator("option").all_inner_texts()
+                nums = [int(o.strip()) for o in options if o.strip().isdigit()]
+                if nums:
+                    return max(nums)
+        except Exception:
+            pass
+
+        return 4
+
+    async def _select_mui_combobox_quantity(
+        self,
+        page: Page,
+        combo: Locator,
+        requested_qty: int,
+    ) -> Tuple[bool, int]:
+        """Click Material-UI combobox, wait for popover menu, and select quantity option."""
+        try:
+            await combo.scroll_into_view_if_needed(timeout=2000)
+            await combo.click()
+            await human_sleep((300, 600))
+
+            # Wait for listbox options to appear
+            await page.wait_for_selector("li[role='option'], .MuiMenuItem-root", timeout=4000)
+            options = page.locator("li[role='option'], .MuiMenuItem-root")
+            count = await options.count()
+            if count == 0:
+                return False, 0
+
+            # Find matching option
+            target_opt: Optional[Locator] = None
+            opt_nums = []
+            for i in range(count):
+                opt = options.nth(i)
+                txt = (await opt.inner_text()).strip()
+                if txt.isdigit():
+                    num = int(txt)
+                    opt_nums.append((num, opt))
+
+            if not opt_nums:
+                return False, 0
+
+            # Find exact match or closest <= requested_qty
+            exact = next((opt for num, opt in opt_nums if num == requested_qty), None)
+            if exact:
+                await exact.click()
+                await human_sleep((300, 500))
+                return True, requested_qty
+
+            # Pick largest available <= requested_qty or max available
+            valid = [n for n, opt in opt_nums if n <= requested_qty and n > 0]
+            chosen_num = max(valid) if valid else max(n for n, opt in opt_nums)
+            chosen_opt = next(opt for num, opt in opt_nums if num == chosen_num)
+            await chosen_opt.click()
+            await human_sleep((300, 500))
+            return True, chosen_num
+
+        except Exception as exc:
+            LOGGER.error(f"Error selecting MUI quantity: {exc}")
+            return False, 0
 
     async def _robust_select_quantity(self, sel: Locator, qty: int) -> Tuple[bool, int]:
-        """Robustly select quantity dropdown with scrolling and multiple fallback methods."""
+        """Select quantity on standard select element."""
         try:
             await sel.scroll_into_view_if_needed(timeout=2000)
         except Exception:
             pass
 
-        # 1. Try standard select_option by value string
         try:
             await sel.select_option(value=str(qty), timeout=2000)
-            val = (await sel.input_value()).strip()
-            if val == str(qty):
-                return True, qty
+            return True, qty
         except Exception:
             pass
 
-        # 2. Try select_option by label string
         try:
             await sel.select_option(label=str(qty), timeout=2000)
-            val = (await sel.input_value()).strip()
-            if val == str(qty):
-                return True, qty
+            return True, qty
         except Exception:
             pass
 
-        # 3. Try finding closest available numeric option
         try:
             options = await sel.locator("option").all()
             texts = [(await o.inner_text()).strip() for o in options]
             available_nums = [int(t) for t in texts if t.isdigit()]
-
             if available_nums:
                 target_qty = min(qty, max(available_nums))
-                # Find matching option index
                 for idx, t in enumerate(texts):
                     if t.isdigit() and int(t) == target_qty:
-                        # JS evaluation for reliable selection trigger
                         await sel.evaluate(
                             "(el, i) => { el.selectedIndex = i; el.dispatchEvent(new Event('change', {bubbles: true})); }",
                             idx,
@@ -164,7 +235,6 @@ class EtixCartHandler:
             except Exception:
                 continue
 
-        # Regex role search fallback
         try:
             btn = page.get_by_role(
                 "button",
@@ -187,18 +257,23 @@ class EtixCartHandler:
         Select ticket quantity, click Add to Cart, and wait for confirmation.
         Returns: (success, reserved_qty, status_message)
         """
-        sel = await self.find_ticket_select(page, ticket_index)
-        if not sel:
-            return False, 0, "Dropdown выбора количества не найден"
+        control = await self.find_ticket_select(page, ticket_index)
+        if not control:
+            return False, 0, "Dropdown/селектор выбора количества не найден"
 
-        # Select quantity
-        ok, selected_qty = await self._robust_select_quantity(sel, requested_qty)
+        tag_name = await control.evaluate("el => el.tagName.toLowerCase()")
+        if tag_name == "select":
+            ok, selected_qty = await self._robust_select_quantity(control, requested_qty)
+        else:
+            # Material-UI custom combobox
+            ok, selected_qty = await self._select_mui_combobox_quantity(page, control, requested_qty)
+
         if not ok or selected_qty == 0:
-            return False, 0, "Не удалось выбрать количество в dropdown"
+            return False, 0, "Не удалось выбрать количество в выпадающем списке"
 
         await human_sleep(self.config.after_click_sleep_ms)
 
-        # Find Add button
+        # Find and click Add button
         add_btn = await self.find_add_button(page)
         if not add_btn:
             return False, 0, "Кнопка 'Add Tickets / Add to Cart' не найдена"
@@ -209,8 +284,8 @@ class EtixCartHandler:
         except Exception as exc:
             return False, 0, f"Ошибка клика 'Add Tickets': {exc}"
 
-        # Wait for navigation or inventory alert
-        await human_sleep((1000, 2500))
+        # Wait for navigation or cart confirmation
+        await human_sleep((1500, 3000))
 
         # Check for inventory exhaustion error message
         try:
@@ -226,24 +301,69 @@ class EtixCartHandler:
         if await self.detector.is_cart_page(page):
             return True, selected_qty, "Успешно добавлено в корзину"
 
-        if "/cart" in page.url.lower() or "/checkout" in page.url.lower():
-            return True, selected_qty, "В корзине"
-
         return True, selected_qty, f"Зарезервировано ({selected_qty} шт.)"
 
     async def clear_cart(self, page: Page) -> None:
         """Release tickets by clearing the shopping cart."""
-        clear_selectors = [
-            "button:has-text('Remove')",
+        # Auto-accept JavaScript confirmation dialogs
+        def handle_dialog(dialog):
+            asyncio.create_task(dialog.accept())
+
+        page.once("dialog", handle_dialog)
+
+        # 1. Primary priority: 'Clear Shopping Cart' button/link
+        bulk_clear_selectors = [
+            "a:has-text('Clear Shopping Cart')",
+            "button:has-text('Clear Shopping Cart')",
+            "a:has-text('Clear Cart')",
+            "button:has-text('Clear Cart')",
+            "button:has-text('Empty Cart')",
+            "a:has-text('Empty Cart')",
+        ]
+
+        for sel in bulk_clear_selectors:
+            try:
+                btn = page.locator(sel).first
+                if await btn.is_visible(timeout=1000):
+                    await btn.scroll_into_view_if_needed(timeout=1500)
+                    await btn.click(timeout=2000)
+                    await asyncio.sleep(1.0)
+
+                    # Check for modal confirmation (e.g. Bootstrap / MUI modal "Are you sure?")
+                    confirm_selectors = [
+                        ".modal button:has-text('Yes')",
+                        ".modal button:has-text('OK')",
+                        ".modal button:has-text('Confirm')",
+                        ".modal button:has-text('Clear')",
+                        "button:has-text('Yes, clear cart')",
+                    ]
+                    for c_sel in confirm_selectors:
+                        try:
+                            c_btn = page.locator(c_sel).first
+                            if await c_btn.is_visible(timeout=1000):
+                                await c_btn.click(timeout=1500)
+                                await asyncio.sleep(0.5)
+                                break
+                        except Exception:
+                            continue
+
+                    LOGGER.info("Cleared entire cart via 'Clear Shopping Cart'.")
+                    return
+            except Exception:
+                continue
+
+        # 2. Fallback: individual item Remove buttons/links
+        item_remove_selectors = [
             "a:has-text('Remove')",
-            "button:has-text('Delete')",
+            "button:has-text('Remove')",
             "a.cart-remove",
             "button.cart-remove",
-            "button:has-text('Empty Cart')",
-            "button:has-text('Очистить')",
-            "button:has-text('Удалить')",
+            "a:has-text('Delete')",
+            "button:has-text('Delete')",
+            "a[href*='remove']",
         ]
-        for sel in clear_selectors:
+
+        for sel in item_remove_selectors:
             try:
                 buttons = page.locator(sel)
                 count = await buttons.count()

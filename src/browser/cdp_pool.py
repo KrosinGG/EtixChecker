@@ -46,22 +46,37 @@ class CDPBrowserPool:
         self.workers: List[BrowserWorker] = []
         self._lock = asyncio.Lock()
 
-    async def initialize(self) -> List[BrowserWorker]:
-        """Launch active profiles and establish CDP connections in parallel batches."""
+    async def initialize(self, count_needed: Optional[int] = None) -> List[BrowserWorker]:
+        """
+        Launch active profiles and establish CDP connections in parallel batches.
+        If count_needed is specified, randomly samples that number of profiles from active list.
+        """
+        import random
+
         active_profiles = self.profile_manager.get_active_profiles()
         if not active_profiles:
             LOGGER.error("No active AdsPower profiles to initialize!")
             return []
 
-        LOGGER.info(f"Starting browser pool for {len(active_profiles)} active profiles...")
+        # If only a subset is needed, pick a randomized sample
+        if count_needed is not None and 0 < count_needed < len(active_profiles):
+            selected_profiles = random.sample(active_profiles, count_needed)
+            LOGGER.info(
+                f"Selected {len(selected_profiles)} randomized profiles for this run "
+                f"(needed: {count_needed}, total available: {len(active_profiles)})"
+            )
+        else:
+            selected_profiles = list(active_profiles)
+            LOGGER.info(f"Starting browser pool for all {len(selected_profiles)} active profiles...")
+
         self.playwright = await async_playwright().start()
 
         # Launch profiles in batches of 3 to avoid overwhelming local system
         batch_size = 3
         workers: List[BrowserWorker] = []
 
-        for i in range(0, len(active_profiles), batch_size):
-            batch = active_profiles[i : i + batch_size]
+        for i in range(0, len(selected_profiles), batch_size):
+            batch = selected_profiles[i : i + batch_size]
             tasks = [
                 self._connect_profile(profile, worker_index=i + offset + 1)
                 for offset, profile in enumerate(batch)
