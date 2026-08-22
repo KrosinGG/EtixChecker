@@ -1,0 +1,38 @@
+# Virtual Environment
+venv/
+env/
+ENV/
+.venv/
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environment variables & secrets
+.env
+.env.local
+.env.*.local
+
+# Playwright binaries & browsers
+ms-playwright/
+
+# Large installers / binaries
+*.exe
+
+# Run artifacts, checkpoints & logs
+runs/
+screens/
+logs/
+*.log
+report.csv
+data/proxy_state/
+data/adspower_backup/
+
+# System / IDE / Temp files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+implementation_plan.md.resolved

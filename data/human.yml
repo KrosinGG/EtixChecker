@@ -1,0 +1,19 @@
+stagger_batch_range:
+- 6
+- 8
+stagger_pause_sec:
+- 0.6
+- 1.2
+think_times_ms:
+  pre_click_add_to_cart:
+  - 300
+  - 700
+  post_click_wait:
+  - 200
+  - 450
+  between_navigations_ms:
+  - 600
+  - 1900
+humanize_level: 1.0
+enable_mouse_move: true
+domain_rate_limit_per_sec: 6.0

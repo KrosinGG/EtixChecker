@@ -1,0 +1,24 @@
+{
+  "Обычная": {
+    "tabs_count": "15",
+    "slowmo_ms": "80",
+    "nav_timeout": "45000",
+    "click_timeout": "20000",
+    "batch_nav_delay_ms": "260,910",
+    "add_sequential_delay_ms": "500,850",
+    "delay_before_clear_carts_s": "5",
+    "headless": false,
+    "randomize_proxies": false
+  },
+  "Быстрая": {
+    "tabs_count": "24",
+    "slowmo_ms": "80",
+    "nav_timeout": "35000",
+    "click_timeout": "15000",
+    "batch_nav_delay_ms": "260,910",
+    "add_sequential_delay_ms": "200,620",
+    "delay_before_clear_carts_s": "3",
+    "headless": true,
+    "randomize_proxies": true
+  }
+}
