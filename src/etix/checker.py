@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import math
+import os
 import random
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -13,13 +14,19 @@ import pandas as pd
 from src.adspower.client import AdsPowerClient
 from src.adspower.profile_manager import AdsPowerProfileManager
 from src.browser.cdp_pool import BrowserWorker, CDPBrowserPool
-from src.browser.human_actions import accept_cookies_if_present, close_blocking_popups, human_sleep
+from src.browser.human_actions import (
+    accept_cookies_if_present,
+    close_blocking_popups,
+    human_sleep,
+    solve_datadome_slider,
+)
 from src.config.settings import AppConfig, CONFIG
 from src.domain.enums import ProfileRole, ShowStatus
 from src.domain.models import CheckResult, Show
 from src.etix.cart_handler import EtixCartHandler
 from src.etix.detector import EtixDetector
 from src.storage.checkpoint import RunContext
+from src.storage.proxy_sync import ProxySyncService
 from src.storage.reporter import Reporter
 from src.utils.logger import LOGGER
 
@@ -116,6 +123,11 @@ class EtixCheckEngine:
         shows = self.load_shows(shows_csv)
         if not shows:
             return []
+
+        # Sync good proxies from remote source (e.g. GitHub Raw / Gist) if configured
+        sync_url = os.getenv("GOOD_PROXIES_SYNC_URL", None)
+        proxy_sync = ProxySyncService(local_file=self.config.good_proxies_file, sync_url=sync_url)
+        await proxy_sync.sync()
 
         # Check AdsPower connection
         if not await self.client.check_status():
@@ -235,16 +247,40 @@ class EtixCheckEngine:
             except Exception:
                 pass
         except Exception as exc:
-            LOGGER.error(f"Navigation failed for primary worker on {show.url}: {exc}")
-            return CheckResult(
-                show_id=show.show_id,
-                name=show.name,
-                url=show.url,
-                status=ShowStatus.FAILED,
-                target=show.target_total,
-                reserved=0,
-                details=f"Ошибка навигации: {exc}",
-            )
+            LOGGER.warning(f"Navigation failed for primary worker on {show.url}: {exc}")
+            if self.detector.is_bad_proxy_error(exc) and self.cdp_pool:
+                LOGGER.info("Attempting Hot-Swap for primary worker due to dead/timed out proxy...")
+                new_primary = await self.cdp_pool.replace_worker_with_reserve(
+                    primary_worker, reason=f"Primary nav error: {exc}"
+                )
+                if new_primary:
+                    primary_worker = new_primary
+                    try:
+                        await primary_worker.page.goto(show.url, wait_until="domcontentloaded", timeout=self.config.nav_timeout)
+                        await human_sleep((500, 1000))
+                        await accept_cookies_if_present(primary_worker.page)
+                        await close_blocking_popups(primary_worker.page)
+                    except Exception as retry_exc:
+                        LOGGER.error(f"Navigation failed again after primary hot-swap: {retry_exc}")
+                        return CheckResult(
+                            show_id=show.show_id,
+                            name=show.name,
+                            url=show.url,
+                            status=ShowStatus.FAILED,
+                            target=show.target_total,
+                            reserved=0,
+                            details=f"Ошибка навигации (прокси не отвечает): {retry_exc}",
+                        )
+            else:
+                return CheckResult(
+                    show_id=show.show_id,
+                    name=show.name,
+                    url=show.url,
+                    status=ShowStatus.FAILED,
+                    target=show.target_total,
+                    reserved=0,
+                    details=f"Ошибка навигации: {exc}",
+                )
 
         # Step 2: Check SOLD OUT
         if await self.detector.is_soldout_page(primary_worker.page):
@@ -276,11 +312,10 @@ class EtixCheckEngine:
                 screenshot_path=screen,
             )
 
-        # Step 4: Check DataDome Block
-        if await self.detector.is_blocked_page(primary_worker.page):
+        # Step 4: Check DataDome Block / Slider and execute 3-step recovery
+        accessible_primary = await self._ensure_worker_accessible(primary_worker, show)
+        if not accessible_primary:
             screen = await self.reporter.save_screenshot(primary_worker.page, show.name, prefix="blocked")
-            LOGGER.warning(f"Worker #{primary_worker.worker_index} encountered DataDome block!")
-            self.profile_manager.record_bad_proxy(primary_worker.profile.proxy_key, "DataDome block")
             return CheckResult(
                 show_id=show.show_id,
                 name=show.name,
@@ -288,9 +323,10 @@ class EtixCheckEngine:
                 status=ShowStatus.BLOCKED,
                 target=show.target_total,
                 reserved=0,
-                details="Заблокировано защитой (Access Temporarily Blocked)",
+                details="Заблокировано защитой DataDome (все 3 шага восстановления исчерпаны)",
                 screenshot_path=screen,
             )
+        primary_worker = accessible_primary
 
         # Step 5: Detect per-order limit
         detected_limit = await self.cart_handler.detect_per_order_limit(
@@ -311,34 +347,64 @@ class EtixCheckEngine:
             f"Using {len(selected_workers)} workers (Limit per order: {max_per_order}, Target: {show.target_total})"
         )
 
-        # Step 6: Concurrently open URL in remaining needed workers
+        # Step 6: Staggered URL navigation in remaining needed workers
         nav_tasks = []
+        accumulated_nav_delay = 0.0
         for w in selected_workers:
             if w == primary_worker:
                 continue
+            accumulated_nav_delay += random.uniform(
+                self.config.batch_nav_delay_ms[0], self.config.batch_nav_delay_ms[1]
+            ) / 1000.0
             nav_tasks.append(
-                self._open_and_prep_page(w.page, show.url, w.worker_index)
+                self._open_and_prep_page(w.page, show.url, w.worker_index, delay_s=accumulated_nav_delay)
             )
 
         if nav_tasks:
             await asyncio.gather(*nav_tasks, return_exceptions=True)
 
-        # Step 7: Concurrently add tickets to cart across selected workers
+        # Verify each worker accessibility (slider/block) before adding to cart
+        verified_workers: List[BrowserWorker] = []
+        for w in selected_workers:
+            ready_w = await self._ensure_worker_accessible(w, show)
+            if ready_w:
+                verified_workers.append(ready_w)
+            else:
+                LOGGER.warning(f"[Worker #{w.worker_index}] Excluded from cart addition due to unrecovered block.")
+
+        selected_workers = verified_workers
+        if not selected_workers:
+            return CheckResult(
+                show_id=show.show_id,
+                name=show.name,
+                url=show.url,
+                status=ShowStatus.BLOCKED,
+                target=show.target_total,
+                reserved=0,
+                details="Все задействованные профили заблокированы DataDome.",
+            )
+
+        # Step 7: Staggered addition to cart across selected workers
         cart_tasks = []
         remaining_to_reserve = show.target_total
+        accumulated_add_delay = 0.0
 
         for w in selected_workers:
             qty_for_worker = min(remaining_to_reserve, max_per_order)
             if qty_for_worker <= 0:
                 break
             cart_tasks.append(
-                self.cart_handler.select_quantity_and_add(
-                    w.page,
-                    requested_qty=qty_for_worker,
+                self._staggered_add_to_cart(
+                    worker=w,
+                    qty=qty_for_worker,
                     ticket_index=show.ticket_index,
+                    delay_s=accumulated_add_delay,
                 )
             )
             remaining_to_reserve -= qty_for_worker
+            accumulated_add_delay += random.uniform(
+                self.config.add_sequential_delay_ms[0], self.config.add_sequential_delay_ms[1]
+            ) / 1000.0
 
         cart_results = await asyncio.gather(*cart_tasks, return_exceptions=True)
 
@@ -374,13 +440,23 @@ class EtixCheckEngine:
             f"Event '{show.name}' result: [{status.value}] Reserved: {total_reserved}/{show.target_total}"
         )
 
-        # Step 9: Release carts after delay
+        # Step 9: Staggered release of carts after hold delay
         if total_reserved > 0:
-            LOGGER.info(f"Waiting {self.config.delay_before_clear_carts_s}s before clearing carts...")
+            LOGGER.info(f"Holding reservations for {self.config.delay_before_clear_carts_s}s before clearing carts...")
             await asyncio.sleep(self.config.delay_before_clear_carts_s)
-            clear_tasks = [self.cart_handler.clear_cart(w.page) for w in success_workers]
+
+            clear_tasks = []
+            accumulated_clear_delay = 0.0
+            for w in success_workers:
+                clear_tasks.append(
+                    self._staggered_clear_cart(w, delay_s=accumulated_clear_delay)
+                )
+                accumulated_clear_delay += random.uniform(
+                    self.config.clear_cart_stagger_ms[0], self.config.clear_cart_stagger_ms[1]
+                ) / 1000.0
+
             await asyncio.gather(*clear_tasks, return_exceptions=True)
-            LOGGER.info("Carts released successfully.")
+            LOGGER.info("All carts released successfully.")
 
         return CheckResult(
             show_id=show.show_id,
@@ -393,21 +469,136 @@ class EtixCheckEngine:
             details=details_str,
         )
 
-    async def _open_and_prep_page(self, page: Any, url: str, worker_index: int) -> bool:
-        """Helper to navigate worker page to URL with jitter."""
+    async def _staggered_add_to_cart(
+        self,
+        worker: BrowserWorker,
+        qty: int,
+        ticket_index: Optional[int],
+        delay_s: float,
+    ) -> Tuple[bool, int, str]:
+        """Wrapper to introduce incremental randomized offset before adding tickets."""
+        if delay_s > 0:
+            LOGGER.debug(f"[Worker #{worker.worker_index}] Waiting {delay_s:.2f}s stagger before Add Tickets...")
+            await asyncio.sleep(delay_s)
+
+        return await self.cart_handler.select_quantity_and_add(
+            worker.page,
+            requested_qty=qty,
+            ticket_index=ticket_index,
+        )
+
+    async def _staggered_clear_cart(
+        self,
+        worker: BrowserWorker,
+        delay_s: float,
+    ) -> None:
+        """Wrapper to introduce incremental randomized offset before clearing cart."""
+        if delay_s > 0:
+            LOGGER.debug(f"[Worker #{worker.worker_index}] Waiting {delay_s:.2f}s stagger before Clear Cart...")
+            await asyncio.sleep(delay_s)
+
+        await self.cart_handler.clear_cart(worker.page)
+
+    async def _open_and_prep_page(
+        self,
+        page: Any,
+        url: str,
+        worker_index: int,
+        delay_s: float = 0.0,
+    ) -> bool:
+        """Helper to navigate worker page to URL with incremental stagger."""
         try:
-            await human_sleep(self.config.batch_nav_delay_ms)
+            if delay_s > 0:
+                await asyncio.sleep(delay_s)
+            else:
+                await human_sleep(self.config.batch_nav_delay_ms)
+
             await page.goto(url, wait_until="domcontentloaded", timeout=self.config.nav_timeout)
             await accept_cookies_if_present(page)
             await close_blocking_popups(page)
+
+            if await self.detector.is_bad_proxy_page(page):
+                LOGGER.warning(f"[Worker #{worker_index}] Proxy connection failed: Chrome error page detected.")
+                return False
+
             try:
                 await page.wait_for_selector(
-                    "select, button:has-text('Add Tickets'), input[value*='Add Tickets']",
-                    timeout=15000,
+                    "select, [role='combobox'], button:has-text('Add Tickets'), input[value*='Add Tickets']",
+                    timeout=12000,
                 )
             except Exception:
                 pass
             return True
         except Exception as exc:
-            LOGGER.warning(f"[Worker #{worker_index}] Open URL failed: {exc}")
+            LOGGER.warning(f"[Worker #{worker_index}] Open URL failed ({exc})")
             return False
+
+    async def _ensure_worker_accessible(
+        self,
+        worker: BrowserWorker,
+        show: Show,
+    ) -> Optional[BrowserWorker]:
+        """
+        Check if worker is facing DataDome slider or block, and execute 3-step recovery:
+        1. Humanized Drag & Drop of slider
+        2. context.clear_cookies() + fresh tab reload
+        3. Hot-Swap with reserve profile configured with clean good proxy
+        """
+        is_blocked = await self.detector.is_blocked_page(worker.page)
+        is_slider = await self.detector.is_slider_captcha(worker.page)
+
+        if not is_blocked and not is_slider:
+            return worker
+
+        LOGGER.warning(
+            f"[Worker #{worker.worker_index}] Encountered DataDome challenge (slider={is_slider}, blocked={is_blocked}). Starting 3-step recovery..."
+        )
+
+        # Stage 1: Fast Humanized Drag & Drop if slider is present
+        if is_slider:
+            LOGGER.info(f"[Worker #{worker.worker_index}] Step 1: Trying humanized slider drag...")
+            solved = await solve_datadome_slider(worker.page)
+            if solved and not await self.detector.is_blocked_page(worker.page) and not await self.detector.is_slider_captcha(worker.page):
+                LOGGER.info(f"[Worker #{worker.worker_index}] Slider successfully solved on Step 1!")
+                return worker
+
+        # Stage 2: Clear cookies via CDP and reload in a fresh tab
+        LOGGER.info(f"[Worker #{worker.worker_index}] Step 2: Clearing cookies and reopening in fresh tab...")
+        try:
+            await worker.context.clear_cookies()
+            old_page = worker.page
+            new_page = await worker.context.new_page()
+            new_page.set_default_navigation_timeout(self.config.nav_timeout)
+            new_page.set_default_timeout(self.config.click_timeout)
+            worker.page = new_page
+            try:
+                await old_page.close()
+            except Exception:
+                pass
+
+            await human_sleep((1000, 2000))
+            await worker.page.goto(show.url, wait_until="domcontentloaded", timeout=self.config.nav_timeout)
+            await accept_cookies_if_present(worker.page)
+            await close_blocking_popups(worker.page)
+
+            if not await self.detector.is_blocked_page(worker.page) and not await self.detector.is_slider_captcha(worker.page):
+                LOGGER.info(f"[Worker #{worker.worker_index}] Successfully unblocked on Step 2 (cookie reset)!")
+                return worker
+        except Exception as exc:
+            LOGGER.warning(f"[Worker #{worker.worker_index}] Step 2 error: {exc}")
+
+        # Stage 3: Hot-Swap on reserve profile with clean good proxy
+        LOGGER.info(f"[Worker #{worker.worker_index}] Step 3: Performing Hot-Swap to reserve profile with good proxy...")
+        if self.cdp_pool:
+            new_worker = await self.cdp_pool.replace_worker_with_reserve(
+                failing_worker=worker,
+                reason="DataDome challenge unrecovered",
+            )
+            if new_worker:
+                await self._open_and_prep_page(new_worker.page, show.url, new_worker.worker_index)
+                if not await self.detector.is_blocked_page(new_worker.page) and not await self.detector.is_slider_captcha(new_worker.page):
+                    LOGGER.info(f"[Worker #{new_worker.worker_index}] Hot-swap successful! Proceeding on new profile.")
+                    return new_worker
+
+        LOGGER.error(f"[Worker #{worker.worker_index}] All 3 recovery steps exhausted.")
+        return None

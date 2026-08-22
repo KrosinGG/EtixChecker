@@ -1,11 +1,7 @@
-"""Application configuration settings."""
-
-from __future__ import annotations
-
 from dataclasses import dataclass, field
 import os
 from pathlib import Path
-from typing import List, Tuple
+from typing import Any, Dict, List, Tuple
 
 
 def _load_dotenv(path: Path = Path(".env")) -> None:
@@ -34,51 +30,63 @@ def _load_dotenv(path: Path = Path(".env")) -> None:
             if "#" in value and not (raw_line.count('"') >= 2 or raw_line.count("'") >= 2):
                 value = value.split("#", 1)[0].rstrip()
 
-            os.environ.setdefault(key, value)
+            if key not in os.environ:
+                os.environ[key] = value
     except Exception:
-        return
+        pass
 
 
 _load_dotenv()
 
 
 def _env_bool(name: str, default: bool) -> bool:
-    raw = os.getenv(name)
-    if raw is None:
+    val = os.getenv(name)
+    if val is None:
         return default
-    val = raw.strip().lower()
-    if val in {"1", "true", "yes", "y", "on"}:
-        return True
-    if val in {"0", "false", "no", "n", "off"}:
-        return False
-    return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
 
 
 def _env_int(name: str, default: int) -> int:
-    raw = os.getenv(name)
-    if raw is None:
+    val = os.getenv(name)
+    if val is None:
         return default
     try:
-        return int(raw.strip())
-    except Exception:
+        return int(val.strip())
+    except ValueError:
         return default
 
 
 def _env_range_ms(name: str, default: Tuple[int, int]) -> Tuple[int, int]:
-    raw = os.getenv(name)
-    if not raw:
+    val = os.getenv(name)
+    if not val:
         return default
-    parts = [p.strip() for p in raw.split(",") if p.strip()]
-    if len(parts) != 2:
-        return default
+    parts = val.split("-") if "-" in val else val.split(",")
+    if len(parts) == 1:
+        try:
+            x = int(parts[0].strip())
+            return x, x
+        except ValueError:
+            return default
     try:
-        lo = int(parts[0])
-        hi = int(parts[1])
-    except Exception:
+        lo = int(parts[0].strip())
+        hi = int(parts[1].strip())
+    except ValueError:
         return default
-    if hi < lo:
+    if lo > hi:
         lo, hi = hi, lo
     return lo, hi
+
+
+# Absolute minimum safe bounds for delays (including +20ms safety margin)
+# Users / UI cannot configure values lower than these thresholds.
+MIN_SAFE_DELAYS: Dict[str, float] = {
+    "batch_nav_delay_ms": 270.0,         # Base min 250ms + 20ms buffer
+    "after_click_sleep_ms": 420.0,       # Base min 400ms + 20ms buffer (MUI state sync)
+    "add_sequential_delay_ms": 520.0,    # Base min 500ms + 20ms buffer (Human action gap)
+    "post_add_wait_ms": 1520.0,          # Base min 1500ms + 20ms buffer (Etix cart creation)
+    "delay_before_clear_carts_s": 2.2,   # Base min 2.0s + 0.2s buffer (Hold confirmation)
+    "clear_cart_stagger_ms": 320.0,      # Base min 300ms + 20ms buffer (Staggered clear)
+}
 
 
 @dataclass(frozen=True)
@@ -92,14 +100,15 @@ class AppConfig:
     # Browser & Navigation timeouts
     headless: bool = _env_bool("ETIX_HEADLESS", False)
     slowmo_ms: int = _env_int("ETIX_SLOWMO_MS", 80)
-    nav_timeout: int = _env_int("ETIX_NAV_TIMEOUT", 45000)
+    nav_timeout: int = _env_int("ETIX_NAV_TIMEOUT", 18000)
     click_timeout: int = _env_int("ETIX_CLICK_TIMEOUT", 20000)
 
-    # Delays & Humanization
-    batch_nav_delay_ms: Tuple[int, int] = _env_range_ms("ETIX_BATCH_NAV_DELAY_MS", (80, 160))
-    after_click_sleep_ms: Tuple[int, int] = _env_range_ms("ETIX_AFTER_CLICK_SLEEP_MS", (600, 800))
-    add_sequential_delay_ms: Tuple[int, int] = _env_range_ms("ETIX_ADD_SEQUENTIAL_DELAY_MS", (500, 850))
-    delay_before_clear_carts_s: float = float(os.getenv("ETIX_DELAY_BEFORE_CLEAR_CARTS_S", "5.0"))
+    # Delays & Humanization (tuned for ~45s per 12 profiles with random jitter)
+    batch_nav_delay_ms: Tuple[int, int] = _env_range_ms("ETIX_BATCH_NAV_DELAY_MS", (600, 1100))
+    after_click_sleep_ms: Tuple[int, int] = _env_range_ms("ETIX_AFTER_CLICK_SLEEP_MS", (500, 900))
+    add_sequential_delay_ms: Tuple[int, int] = _env_range_ms("ETIX_ADD_SEQUENTIAL_DELAY_MS", (1000, 1800))
+    delay_before_clear_carts_s: float = float(os.getenv("ETIX_DELAY_BEFORE_CLEAR_CARTS_S", "4.0"))
+    clear_cart_stagger_ms: Tuple[int, int] = _env_range_ms("ETIX_CLEAR_CART_STAGGER_MS", (600, 1000))
     strict_all_carts: bool = _env_bool("ETIX_STRICT_ALL_CARTS", True)
 
     # File paths
@@ -177,6 +186,26 @@ class AppConfig:
             r"уменьш",
         ]
     )
+
+
+def estimate_check_duration_seconds(profiles_count: int, config: AppConfig) -> float:
+    """
+    Estimate expected duration in seconds for checking one show with given number of profiles.
+    """
+    if profiles_count <= 0:
+        return 0.0
+
+    avg_nav_delay = sum(config.batch_nav_delay_ms) / 2000.0
+    avg_add_delay = sum(config.add_sequential_delay_ms) / 2000.0
+    avg_clear_delay = sum(config.clear_cart_stagger_ms) / 2000.0
+
+    shifts = max(0, profiles_count - 1)
+    nav_time = shifts * avg_nav_delay + 2.5
+    add_time = shifts * avg_add_delay + 2.5
+    hold_time = config.delay_before_clear_carts_s
+    clear_time = shifts * avg_clear_delay + 1.2
+
+    return round(nav_time + add_time + hold_time + clear_time, 1)
 
 
 CONFIG = AppConfig()

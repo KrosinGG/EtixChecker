@@ -127,10 +127,96 @@ class AdsPowerClient:
         LOGGER.warning(f"Failed to start AdsPower browser for {user_id}: {res.get('msg')}")
         return None
 
+    async def update_profile_proxy(
+        self,
+        user_id: str,
+        proxy_config: Dict[str, Any],
+    ) -> bool:
+        """
+        Update proxy configuration for a profile via AdsPower API.
+        proxy_config: dict with keys proxy_soft, proxy_type, proxy_host, proxy_port, proxy_user, proxy_password.
+        """
+        payload = {
+            "user_id": user_id,
+            "user_proxy_config": proxy_config,
+        }
+        res = await self._request("POST", "/api/v1/user/update", json_data=payload)
+        if res.get("code") == 0:
+            LOGGER.info(f"Successfully updated proxy for profile {user_id} in AdsPower")
+            return True
+        LOGGER.error(f"Failed to update proxy for profile {user_id}: {res.get('msg')}")
+        return False
+
+    @staticmethod
+    def parse_proxy_string(proxy_str: str) -> Optional[Dict[str, Any]]:
+        """
+        Parse proxy string into AdsPower user_proxy_config dictionary.
+        Supports:
+          - host:port:user:pass
+          - user:pass@host:port
+          - http://user:pass@host:port
+          - socks5://user:pass@host:port
+          - host:port
+        """
+        raw = proxy_str.strip()
+        if not raw:
+            return None
+
+        proxy_type = "http"
+        if raw.startswith("socks5://"):
+            proxy_type = "socks5"
+            raw = raw[len("socks5://") :]
+        elif raw.startswith("http://"):
+            proxy_type = "http"
+            raw = raw[len("http://") :]
+        elif raw.startswith("https://"):
+            proxy_type = "https"
+            raw = raw[len("https://") :]
+
+        user = ""
+        password = ""
+        host = ""
+        port = ""
+
+        if "@" in raw:
+            # user:pass@host:port
+            auth, host_port = raw.split("@", 1)
+            if ":" in auth:
+                user, password = auth.split(":", 1)
+            else:
+                user = auth
+            if ":" in host_port:
+                host, port = host_port.split(":", 1)
+            else:
+                host = host_port
+        elif raw.count(":") == 3:
+            # host:port:user:pass
+            parts = raw.split(":")
+            host, port, user, password = parts[0], parts[1], parts[2], parts[3]
+        elif raw.count(":") == 1:
+            # host:port
+            host, port = raw.split(":")
+        else:
+            return None
+
+        return {
+            "proxy_soft": "other",
+            "proxy_type": proxy_type,
+            "proxy_host": host.strip(),
+            "proxy_port": port.strip(),
+            "proxy_user": user.strip(),
+            "proxy_password": password.strip(),
+            "proxy_url": "",
+        }
+
     async def stop_browser(self, user_id: str) -> bool:
-        """Stop browser for profile user_id."""
+        """Stop browser instance for profile user_id."""
         res = await self._request("GET", "/api/v1/browser/stop", params={"user_id": user_id})
-        return res.get("code") == 0
+        if res.get("code") == 0:
+            LOGGER.info(f"Successfully stopped browser for profile {user_id}")
+            return True
+        LOGGER.warning(f"Failed to stop browser {user_id}: {res.get('msg')}")
+        return False
 
     async def get_active_browsers(self) -> List[str]:
         """Get list of active browser user_ids."""
