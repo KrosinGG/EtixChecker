@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from typing import Optional, Tuple
 from playwright.async_api import Page, Locator
 
@@ -24,26 +25,52 @@ class EtixCartHandler:
         page: Page,
         ticket_index: Optional[int] = None,
     ) -> Optional[Locator]:
-        """Find the appropriate ticket quantity select dropdown or input."""
-        selects = page.locator("select[name*='quantity'], select[id*='quantity'], select.ticket-quantity")
-        count = await selects.count()
-        if count == 0:
-            # Fallback generic select
-            selects = page.locator("select")
-            count = await selects.count()
+        """
+        Find the appropriate ticket quantity select dropdown.
+        Supports 1-based ticket_index (e.g. 1 = 1st ticket type, 2 = 2nd ticket type).
+        """
+        # Wait up to 12s for select elements to be dynamically rendered by Etix JS
+        try:
+            await page.wait_for_selector("select", timeout=12000)
+        except Exception:
+            pass
 
+        selects = page.locator("select")
+        count = await selects.count()
         if count == 0:
             return None
 
-        if ticket_index is not None and 0 <= ticket_index < count:
-            return selects.nth(ticket_index)
-
-        # Default to first visible select
+        # Filter to visible select elements
+        candidates = []
         for i in range(count):
-            candidate = selects.nth(i)
-            if await candidate.is_visible(timeout=500):
-                return candidate
-        return selects.first
+            sel = selects.nth(i)
+            try:
+                if await sel.is_visible(timeout=500):
+                    candidates.append(sel)
+            except Exception:
+                continue
+
+        if not candidates:
+            # Fallback to first select in DOM if visibility check was too strict
+            return selects.first
+
+        # Handle 1-based ticket_index (e.g. ticket_index=1 -> index 0, ticket_index=2 -> index 1)
+        if ticket_index is not None and candidates:
+            if ticket_index > 0:
+                idx = ticket_index - 1
+            else:
+                idx = ticket_index  # e.g. -1 for last select
+
+            if 0 <= idx < len(candidates):
+                return candidates[idx]
+
+            # If index is out of bounds, pick the closest available (e.g. last select)
+            LOGGER.warning(
+                f"ticket_index {ticket_index} exceeds available selects ({len(candidates)}). Using select at index {len(candidates)-1}."
+            )
+            return candidates[-1]
+
+        return candidates[0]
 
     async def detect_per_order_limit(
         self,
@@ -67,6 +94,89 @@ class EtixCartHandler:
             pass
         return 1
 
+    async def _robust_select_quantity(self, sel: Locator, qty: int) -> Tuple[bool, int]:
+        """Robustly select quantity dropdown with scrolling and multiple fallback methods."""
+        try:
+            await sel.scroll_into_view_if_needed(timeout=2000)
+        except Exception:
+            pass
+
+        # 1. Try standard select_option by value string
+        try:
+            await sel.select_option(value=str(qty), timeout=2000)
+            val = (await sel.input_value()).strip()
+            if val == str(qty):
+                return True, qty
+        except Exception:
+            pass
+
+        # 2. Try select_option by label string
+        try:
+            await sel.select_option(label=str(qty), timeout=2000)
+            val = (await sel.input_value()).strip()
+            if val == str(qty):
+                return True, qty
+        except Exception:
+            pass
+
+        # 3. Try finding closest available numeric option
+        try:
+            options = await sel.locator("option").all()
+            texts = [(await o.inner_text()).strip() for o in options]
+            available_nums = [int(t) for t in texts if t.isdigit()]
+
+            if available_nums:
+                target_qty = min(qty, max(available_nums))
+                # Find matching option index
+                for idx, t in enumerate(texts):
+                    if t.isdigit() and int(t) == target_qty:
+                        # JS evaluation for reliable selection trigger
+                        await sel.evaluate(
+                            "(el, i) => { el.selectedIndex = i; el.dispatchEvent(new Event('change', {bubbles: true})); }",
+                            idx,
+                        )
+                        return True, target_qty
+        except Exception:
+            pass
+
+        return False, 0
+
+    async def find_add_button(self, page: Page) -> Optional[Locator]:
+        """Find 'Add Tickets' or 'Add to Cart' button."""
+        add_btn_selectors = [
+            "button:has-text('Add Tickets')",
+            "input[type='submit'][value*='Add Tickets']",
+            "button:has-text('ADD TICKETS')",
+            "button:has-text('Add to Cart')",
+            "button[type='submit']:has-text('Add to Cart')",
+            "input[type='submit'][value*='Add to Cart']",
+            "button.btn-purchase",
+            "button#purchase-btn",
+            "button:has-text('Купить')",
+            "button:has-text('Добавить в корзину')",
+        ]
+
+        for selector in add_btn_selectors:
+            try:
+                candidate = page.locator(selector).first
+                if await candidate.is_visible(timeout=500):
+                    return candidate
+            except Exception:
+                continue
+
+        # Regex role search fallback
+        try:
+            btn = page.get_by_role(
+                "button",
+                name=re.compile(r"ADD\s*TICKETS|ADD\s*TO\s*CART|КУПИТЬ", re.I),
+            ).first
+            if await btn.is_visible(timeout=500):
+                return btn
+        except Exception:
+            pass
+
+        return None
+
     async def select_quantity_and_add(
         self,
         page: Page,
@@ -81,54 +191,26 @@ class EtixCartHandler:
         if not sel:
             return False, 0, "Dropdown выбора количества не найден"
 
-        # Determine available option to select
-        try:
-            options = await sel.locator("option").all_inner_texts()
-            num_opts = [int(o.strip()) for o in options if o.strip().isdigit()]
-            if not num_opts:
-                return False, 0, "Нет доступных опций количества"
+        # Select quantity
+        ok, selected_qty = await self._robust_select_quantity(sel, requested_qty)
+        if not ok or selected_qty == 0:
+            return False, 0, "Не удалось выбрать количество в dropdown"
 
-            max_opt = max(num_opts)
-            target_qty = min(requested_qty, max_opt)
+        await human_sleep(self.config.after_click_sleep_ms)
 
-            # Select target quantity
-            await sel.select_option(value=str(target_qty), timeout=3000)
-            await human_sleep(self.config.after_click_sleep_ms)
-        except Exception as exc:
-            return False, 0, f"Ошибка выбора количества: {exc}"
-
-        # Find Add to Cart button
-        add_btn_selectors = [
-            "button[type='submit']:has-text('Add to Cart')",
-            "button:has-text('Add to Cart')",
-            "input[type='submit'][value*='Add to Cart']",
-            "button:has-text('Add Tickets')",
-            "button.btn-purchase",
-            "button#purchase-btn",
-            "button:has-text('Купить')",
-            "button:has-text('Добавить в корзину')",
-        ]
-
-        add_btn: Optional[Locator] = None
-        for selector in add_btn_selectors:
-            try:
-                candidate = page.locator(selector).first
-                if await candidate.is_visible(timeout=500):
-                    add_btn = candidate
-                    break
-            except Exception:
-                continue
-
+        # Find Add button
+        add_btn = await self.find_add_button(page)
         if not add_btn:
-            return False, 0, "Кнопка 'Add to Cart' не найдена"
+            return False, 0, "Кнопка 'Add Tickets / Add to Cart' не найдена"
 
         try:
+            await add_btn.scroll_into_view_if_needed(timeout=2000)
             await add_btn.click(timeout=self.config.click_timeout)
         except Exception as exc:
-            return False, 0, f"Ошибка клика 'Add to Cart': {exc}"
+            return False, 0, f"Ошибка клика 'Add Tickets': {exc}"
 
-        # Wait for navigation or alert
-        await human_sleep((1000, 2000))
+        # Wait for navigation or inventory alert
+        await human_sleep((1000, 2500))
 
         # Check for inventory exhaustion error message
         try:
@@ -142,13 +224,12 @@ class EtixCartHandler:
 
         # Check if we arrived in cart / checkout
         if await self.detector.is_cart_page(page):
-            return True, target_qty, "Успешно добавлено в корзину"
+            return True, selected_qty, "Успешно добавлено в корзину"
 
-        # If URL contains cart or order summary is visible
-        if "/cart" in page.url.lower():
-            return True, target_qty, "В корзине"
+        if "/cart" in page.url.lower() or "/checkout" in page.url.lower():
+            return True, selected_qty, "В корзине"
 
-        return True, target_qty, "Запрос отправлен (предположительно в корзине)"
+        return True, selected_qty, f"Зарезервировано ({selected_qty} шт.)"
 
     async def clear_cart(self, page: Page) -> None:
         """Release tickets by clearing the shopping cart."""

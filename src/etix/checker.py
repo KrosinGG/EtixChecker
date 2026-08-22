@@ -79,16 +79,16 @@ class EtixCheckEngine:
 
             name = str(row.get("name", "")).strip() or url
             target_total = 1
-            if "target_total" in row and str(row["target_total"]).isdigit():
-                target_total = max(1, int(row["target_total"]))
+            if "target_total" in row and str(row["target_total"]).strip().isdigit():
+                target_total = max(1, int(str(row["target_total"]).strip()))
 
             max_per_order = 1
-            if "max_per_order" in row and str(row["max_per_order"]).isdigit():
-                max_per_order = max(1, int(row["max_per_order"]))
+            if "max_per_order" in row and str(row["max_per_order"]).strip().isdigit():
+                max_per_order = max(1, int(str(row["max_per_order"]).strip()))
 
             ticket_index = None
             if "ticket_index" in row and str(row["ticket_index"]).strip().isdigit():
-                ticket_index = int(row["ticket_index"])
+                ticket_index = int(str(row["ticket_index"]).strip())
 
             show_id = make_show_id(name, url)
             shows.append(
@@ -200,7 +200,7 @@ class EtixCheckEngine:
         workers: List[BrowserWorker],
     ) -> CheckResult:
         """Check a single event URL across the pool of browser workers."""
-        LOGGER.info(f"--> Checking event '{show.name}' (Target: {show.target_total} tickets)")
+        LOGGER.info(f"--> Checking event '{show.name}' (Target: {show.target_total} tickets, Ticket index: {show.ticket_index})")
 
         # Step 1: Open show URL in primary worker
         primary_worker = workers[0]
@@ -213,6 +213,13 @@ class EtixCheckEngine:
             await human_sleep((500, 1000))
             await accept_cookies_if_present(primary_worker.page)
             await close_blocking_popups(primary_worker.page)
+            try:
+                await primary_worker.page.wait_for_selector(
+                    "select, button:has-text('Add Tickets'), input[value*='Add Tickets'], div[role='alert']",
+                    timeout=15000,
+                )
+            except Exception:
+                pass
         except Exception as exc:
             LOGGER.error(f"Navigation failed for primary worker on {show.url}: {exc}")
             return CheckResult(
@@ -376,6 +383,13 @@ class EtixCheckEngine:
             await page.goto(url, wait_until="domcontentloaded", timeout=self.config.nav_timeout)
             await accept_cookies_if_present(page)
             await close_blocking_popups(page)
+            try:
+                await page.wait_for_selector(
+                    "select, button:has-text('Add Tickets'), input[value*='Add Tickets']",
+                    timeout=15000,
+                )
+            except Exception:
+                pass
             return True
         except Exception as exc:
             LOGGER.warning(f"[Worker #{worker_index}] Open URL failed: {exc}")
