@@ -17,7 +17,7 @@ if not exist "%LOGDIR%" mkdir "%LOGDIR%" >nul 2>&1
 rem 1) venv
 if not exist "%VPY%" (
   echo Installing components...
-  py -3 -m venv "%VENV%" || (echo [ERROR] venv create failed & pause & exit /b 1)
+  py -3 -m venv "%VENV%" >nul 2>&1 || python -m venv "%VENV%" >nul 2>&1 || (echo [ERROR] venv create failed & pause & exit /b 1)
 )
 
 rem 2) deps (������ ���� ���)

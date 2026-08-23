@@ -171,11 +171,21 @@ if not exist "data\shows.csv" (
 )
 
 rem ------------------------------------------------------------------------------
-rem 6. Создание ярлыка на Рабочем столе
+rem 6. Создание ярлыка на Рабочем столе (бесшумный запуск без черного окна CMD)
 rem ------------------------------------------------------------------------------
 echo [*] Создание ярлыка на Рабочем столе...
 set "ICON_PATH=%CD%\icons\etix_robot_round.ico"
-set "LAUNCHER_PATH=%CD%\run_gui.bat"
+set "LAUNCHER_PATH=%CD%\run_gui.vbs"
+
+if not exist "run_gui.vbs" (
+    (
+        echo Set shell = CreateObject^("WScript.Shell"^)
+        echo Set fso = CreateObject^("Scripting.FileSystemObject"^)
+        echo scriptDir = fso.GetParentFolderName^(WScript.ScriptFullName^)
+        echo cmd = "cmd /c """ ^& scriptDir ^& "\run_gui.bat"" --no-pause"
+        echo shell.Run cmd, 0, False
+    ) > "run_gui.vbs"
+)
 
 powershell -NoProfile -Command "$ws = New-Object -ComObject WScript.Shell; $desktop = [System.Environment]::GetFolderPath('Desktop'); $s = $ws.CreateShortcut(\"$desktop\Etix Checker 2026.lnk\"); $s.TargetPath = '%LAUNCHER_PATH%'; $s.WorkingDirectory = '%CD%'; if (Test-Path '%ICON_PATH%') { $s.IconLocation = '%ICON_PATH%' }; $s.Description = 'Etix Checker 2026 — AdsPower CDP Edition'; $s.Save()"
 echo [+] Ярлык «Etix Checker 2026» создан на рабочем столе.
