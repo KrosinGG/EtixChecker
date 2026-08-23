@@ -34,7 +34,7 @@ try {
     Set-Location $scriptDir
 
     # --------------------------------------------------------------------------
-    # 1. Определение целевой рабочей папки
+    # 1. Определение целевой рабочей папки и исходных файлов
     # --------------------------------------------------------------------------
     $isRepoFolder = (Test-Path (Join-Path $scriptDir "gui_app.py")) -or (Test-Path (Join-Path $scriptDir "requirements.txt"))
 
@@ -50,32 +50,61 @@ try {
         # Проверяем, содержит ли папка файлы репозитория
         $repoReady = (Test-Path (Join-Path $scriptDir "gui_app.py"))
         if (-not $repoReady) {
-            Write-Host "[*] Загрузка актуального репозитория проекта с GitHub..." -ForegroundColor Cyan
-            $gitExists = Get-Command "git" -ErrorAction SilentlyContinue
+            Write-Host "[*] Загрузка файлов проекта с GitHub..." -ForegroundColor Cyan
+            $downloadSuccess = $false
 
+            # Попытка через Git
+            $gitExists = Get-Command "git" -ErrorAction SilentlyContinue
             if ($gitExists) {
-                Write-Host "[*] Клонирование репозитория через Git..." -ForegroundColor Gray
-                & git clone https://github.com/KrosinGG/EtixChecker.git .
-            } else {
-                Write-Host "[*] Git не найден. Загрузка архива проекта с GitHub..." -ForegroundColor Gray
+                Write-Host "[*] Попытка клонирования через Git..." -ForegroundColor Gray
+                try {
+                    & git clone https://github.com/KrosinGG/EtixChecker.git . 2>$null
+                    if (Test-Path (Join-Path $scriptDir "gui_app.py")) {
+                        $downloadSuccess = $true
+                    }
+                } catch {}
+            }
+
+            # Попытка через ZIP
+            if (-not $downloadSuccess) {
+                Write-Host "[*] Загрузка архива проекта..." -ForegroundColor Gray
                 $zipPath = Join-Path $env:TEMP "repo_$RANDOM.zip"
                 $tempExtract = Join-Path $env:TEMP "extract_$RANDOM"
                 
                 $wc = New-Object System.Net.WebClient
-                $downloadUrl = "https://github.com/KrosinGG/EtixChecker/archive/refs/heads/main.zip"
-                try {
-                    $wc.DownloadFile($downloadUrl, $zipPath)
-                } catch {
-                    $downloadUrl = "https://github.com/KrosinGG/EtixChecker/archive/refs/heads/master.zip"
-                    $wc.DownloadFile($downloadUrl, $zipPath)
-                }
+                $wc.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
                 
-                Expand-Archive -Path $zipPath -DestinationPath $tempExtract -Force
-                $extractedSub = Get-ChildItem -Path $tempExtract | Select-Object -First 1
-                if ($extractedSub) {
-                    Copy-Item -Path "$($extractedSub.FullName)\*" -Destination $scriptDir -Recurse -Force
-                }
-                Remove-Item -Path $zipPath, $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
+                try {
+                    $downloadUrl = "https://github.com/KrosinGG/EtixChecker/archive/refs/heads/main.zip"
+                    $wc.DownloadFile($downloadUrl, $zipPath)
+                    Expand-Archive -Path $zipPath -DestinationPath $tempExtract -Force
+                    $extractedSub = Get-ChildItem -Path $tempExtract | Select-Object -First 1
+                    if ($extractedSub) {
+                        Copy-Item -Path "$($extractedSub.FullName)\*" -Destination $scriptDir -Recurse -Force
+                    }
+                    Remove-Item -Path $zipPath, $tempExtract -Recurse -Force -ErrorAction SilentlyContinue
+                    if (Test-Path (Join-Path $scriptDir "gui_app.py")) {
+                        $downloadSuccess = $true
+                    }
+                } catch {}
+            }
+
+            if (-not $downloadSuccess) {
+                Write-Host ""
+                Write-Host "==============================================================================" -ForegroundColor Yellow
+                Write-Host "⚠️  ВНИМАНИЕ: РЕПОЗИТОРИЙ GITHUB ЯВЛЯЕТСЯ ПРИВАТНЫМ" -ForegroundColor Yellow
+                Write-Host "==============================================================================" -ForegroundColor Yellow
+                Write-Host ""
+                Write-Host "Файлы проекта не могут быть скачаны анонимно без авторизации в GitHub." -ForegroundColor White
+                Write-Host ""
+                Write-Host "КАК УСТАНОВИТЬ ПРОГРАММУ КЛИЕНТУ:" -ForegroundColor Cyan
+                Write-Host "  1. Передайте клиенту архив с файлами проекта (например, EtixChecker.zip)." -ForegroundColor White
+                Write-Host "  2. Клиент распаковывает архив в любую папку." -ForegroundColor White
+                Write-Host "  3. Запускает файл setup_installer.bat ВНУТРИ распакованной папки." -ForegroundColor White
+                Write-Host ""
+                Write-Host "Установщик автоматически настроит Python, зависимости и ярлык на Рабочем столе!" -ForegroundColor Green
+                Write-Host ""
+                throw "Файлы проекта не найдены. Пожалуйста, запустите setup_installer.bat внутри папки с распакованным проектом."
             }
         }
     }

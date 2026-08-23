@@ -37,3 +37,5 @@ Thumbs.db
 .vscode/
 implementation_plan.md.resolved
 PROJECT_CONTEXT.md
+
+release/
