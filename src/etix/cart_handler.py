@@ -24,38 +24,80 @@ class EtixCartHandler:
         """
         Find all ticket quantity controls on page.
         Supports Material-UI comboboxes and standard select elements.
+        Distinguishes between quantity dropdowns (0, 1, 2...) and price tier dropdowns ('Best Available').
         """
         try:
             await page.wait_for_selector(
-                "[role='combobox'], .MuiSelect-select, .smoketest-ticket-quantity, select",
+                ".smoketest-ticket-quantity, [role='combobox'], .MuiSelect-select, select",
                 timeout=12000,
             )
         except Exception:
             pass
 
-        # 1. Search for Material-UI comboboxes
-        mui_combos = page.locator("[role='combobox'], .MuiSelect-select")
-        count = await mui_combos.count()
         candidates: List[Locator] = []
 
-        for i in range(count):
-            loc = mui_combos.nth(i)
-            try:
-                if await loc.is_visible(timeout=500):
+        # 1. Primary Strategy for Material-UI: .smoketest-ticket-quantity containers
+        mui_qty_containers = page.locator(".smoketest-ticket-quantity [role='combobox'], .smoketest-ticket-quantity .MuiSelect-select")
+        count = await mui_qty_containers.count()
+        if count > 0:
+            for i in range(count):
+                loc = mui_qty_containers.nth(i)
+                try:
+                    if await loc.is_visible(timeout=500):
+                        candidates.append(loc)
+                except Exception:
+                    continue
+            if candidates:
+                return candidates
+
+        # 2. General Material-UI comboboxes with exclusion of price/selection dropdowns
+        all_mui_combos = page.locator("[role='combobox'], .MuiSelect-select")
+        count = await all_mui_combos.count()
+        if count > 0:
+            for i in range(count):
+                loc = all_mui_combos.nth(i)
+                try:
+                    if not await loc.is_visible(timeout=500):
+                        continue
+
+                    # Filter out price/section selection dropdowns:
+                    el_id = (await loc.get_attribute("id") or "").strip().lower()
+                    el_text = (await loc.inner_text()).strip()
+
+                    # Price dropdowns have id 'mui-component-select-selection' or text like 'Best Available' / 'Лучшие из доступных'
+                    if "selection" in el_id:
+                        continue
+                    if any(phrase in el_text.lower() for phrase in ["best available", "лучшие из доступных", "best", "price level"]):
+                        continue
+
+                    # Quantity dropdowns usually show digits ('0', '1', '2'...) or have numeric id like mui-component-select-12345
                     candidates.append(loc)
-            except Exception:
-                continue
+                except Exception:
+                    continue
 
-        if candidates:
-            return candidates
+            if candidates:
+                return candidates
 
-        # 2. Search for standard select tags
+        # 3. Standard <select> elements (filtered for quantity vs price)
         selects = page.locator("select")
         count = await selects.count()
         for i in range(count):
             loc = selects.nth(i)
             try:
-                if await loc.is_visible(timeout=500):
+                if not await loc.is_visible(timeout=500):
+                    continue
+
+                sel_name = (await loc.get_attribute("name") or "").strip().lower()
+                sel_id = (await loc.get_attribute("id") or "").strip().lower()
+
+                # If name or id explicitly indicates price/section selection, skip
+                if any(k in sel_name or k in sel_id for k in ["priceselection", "price_level", "pricecode", "section"]):
+                    continue
+
+                # Check options: quantity selects have numbers [0, 1, 2, 3...]
+                opts = await loc.locator("option").all_inner_texts()
+                nums = [o.strip() for o in opts if o.strip().isdigit()]
+                if nums or any(k in sel_name or k in sel_id for k in ["quantity", "qty", "ticket"]):
                     candidates.append(loc)
             except Exception:
                 continue
@@ -163,9 +205,9 @@ class EtixCartHandler:
                 await human_sleep((300, 500))
                 return True, requested_qty
 
-            # Pick largest available <= requested_qty or max available
+            # Pick largest available <= requested_qty or smallest available > requested_qty
             valid = [n for n, opt in opt_nums if n <= requested_qty and n > 0]
-            chosen_num = max(valid) if valid else max(n for n, opt in opt_nums)
+            chosen_num = max(valid) if valid else min(n for n, opt in opt_nums if n > 0)
             chosen_opt = next(opt for num, opt in opt_nums if num == chosen_num)
             await chosen_opt.click()
             await human_sleep((300, 500))
@@ -197,9 +239,10 @@ class EtixCartHandler:
         try:
             options = await sel.locator("option").all()
             texts = [(await o.inner_text()).strip() for o in options]
-            available_nums = [int(t) for t in texts if t.isdigit()]
+            available_nums = [int(t) for t in texts if t.isdigit() and int(t) > 0]
             if available_nums:
-                target_qty = min(qty, max(available_nums))
+                valid_nums = [n for n in available_nums if n <= qty]
+                target_qty = max(valid_nums) if valid_nums else min(available_nums)
                 for idx, t in enumerate(texts):
                     if t.isdigit() and int(t) == target_qty:
                         await sel.evaluate(
