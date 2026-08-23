@@ -139,11 +139,19 @@ class EtixCartHandler:
         page: Page,
         ticket_index: Optional[int] = None,
     ) -> int:
-        """Detect max quantity per order from page text or options."""
-        # 1. Check for text pattern on page: "Limit X tickets per order"
+        """Detect max quantity per order from page text, helper labels, or select options."""
+        # 1. Check helper element (.smoketest-helper / #limit-helper / .limit-text)
         try:
+            helper_loc = page.locator(".smoketest-helper, [class*='helper'], .limit-info")
+            if await helper_loc.count() > 0:
+                for i in range(await helper_loc.count()):
+                    txt = await helper_loc.nth(i).inner_text()
+                    m = re.search(r"(?:limit|лимит|max)\s*(\d+)", txt, re.I)
+                    if m:
+                        return int(m.group(1))
+
             body_text = await page.inner_text("body", timeout=1500)
-            m = re.search(r"Limit\s+(\d+)\s+tickets?\s+per\s+order", body_text, re.I)
+            m = re.search(r"(?:limit|лимит|max(?:imum)?)\s*(\d+)\s*(?:tickets?|билет|\/|per|на)?", body_text, re.I)
             if m:
                 return int(m.group(1))
         except Exception:
@@ -151,18 +159,16 @@ class EtixCartHandler:
 
         # 2. Check options of standard select if present
         sel = await self.find_ticket_select(page, ticket_index)
-        if not sel:
-            return 4
-
-        try:
-            tag_name = await sel.evaluate("el => el.tagName.toLowerCase()")
-            if tag_name == "select":
-                options = await sel.locator("option").all_inner_texts()
-                nums = [int(o.strip()) for o in options if o.strip().isdigit()]
-                if nums:
-                    return max(nums)
-        except Exception:
-            pass
+        if sel:
+            try:
+                tag_name = await sel.evaluate("el => el.tagName.toLowerCase()")
+                if tag_name == "select":
+                    options = await sel.locator("option").all_inner_texts()
+                    nums = [int(o.strip()) for o in options if o.strip().isdigit()]
+                    if nums:
+                        return max(nums)
+            except Exception:
+                pass
 
         return 4
 

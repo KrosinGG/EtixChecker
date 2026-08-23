@@ -98,7 +98,7 @@ class ShowCardWidget(ctk.CTkFrame):
         self.lbl_name.pack(side="left", fill="x")
 
         # Subtitle details (Target & ticket index)
-        sub_info = f"Цель: {self.show.target_total} шт. • Лимит: {self.show.max_per_order}/заказ"
+        sub_info = f"Цель: {self.show.target_total} шт. • Лимит: {self.show.max_per_order}"
         if self.show.ticket_index:
             sub_info += f" • Тип билета #{self.show.ticket_index}"
 

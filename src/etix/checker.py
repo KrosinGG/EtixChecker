@@ -328,14 +328,15 @@ class EtixCheckEngine:
             )
         primary_worker = accessible_primary
 
-        # Step 5: Detect per-order limit
-        detected_limit = await self.cart_handler.detect_per_order_limit(
-            primary_worker.page, show.ticket_index
-        )
+        # Step 5: Determine per-order limit (strictly respect show.max_per_order from shows.csv)
         if show.max_per_order and show.max_per_order > 0:
-            effective_max_per_order = min(show.max_per_order, detected_limit)
+            effective_max_per_order = show.max_per_order
         else:
-            effective_max_per_order = detected_limit
+            detected_limit = await self.cart_handler.detect_per_order_limit(
+                primary_worker.page, show.ticket_index
+            )
+            effective_max_per_order = detected_limit if (detected_limit and detected_limit > 0) else 4
+
         if effective_max_per_order <= 0:
             effective_max_per_order = 1
 
