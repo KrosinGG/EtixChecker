@@ -336,15 +336,57 @@ class EtixCartHandler:
         # Wait for navigation or cart confirmation
         await human_sleep((1500, 3000))
 
-        # Check for inventory exhaustion error message
+        # Check for inventory exhaustion or per-order limit error message
         try:
-            alert = page.locator(".alert-danger, .alert-warning, div[role='alert'], .error-message").first
-            if await alert.is_visible(timeout=1000):
-                alert_text = (await alert.inner_text()).strip()
-                if self.detector.is_inventory_message(alert_text):
-                    return False, 0, f"Лимит инвентаря: {alert_text}"
-        except Exception:
-            pass
+            alert_selectors = [
+                ".alert-danger",
+                ".alert-warning",
+                ".alert-error",
+                "div[role='alert']",
+                ".alert",
+                ".error-message",
+                ".smoketest-error",
+                "[class*='alert']",
+                "[class*='error']",
+            ]
+            for a_sel in alert_selectors:
+                alert = page.locator(a_sel).first
+                if await alert.is_visible(timeout=500):
+                    alert_text = (await alert.inner_text()).strip()
+                    if (
+                        self.detector.is_inventory_message(alert_text)
+                        or "sorry" in alert_text.lower()
+                        or "limit" in alert_text.lower()
+                        or "over the per order" in alert_text.lower()
+                    ):
+                        LOGGER.warning(f"Add tickets rejected by site: '{alert_text}'")
+
+                        # Auto-recovery: If error mentions specific allowed limit (e.g. "over the per order limit of 4")
+                        m_limit = re.search(r"(?:limit\s+of|лимит(?:\s+в)?)\s*(\d+)", alert_text, re.I)
+                        if m_limit:
+                            allowed_limit = int(m_limit.group(1))
+                            if 0 < allowed_limit < requested_qty:
+                                LOGGER.info(
+                                    f"Auto-adjusting requested quantity from {requested_qty} to allowed limit {allowed_limit} and retrying..."
+                                )
+                                if tag_name == "select":
+                                    ok_retry, adj_qty = await self._robust_select_quantity(control, allowed_limit)
+                                else:
+                                    ok_retry, adj_qty = await self._select_mui_combobox_quantity(page, control, allowed_limit)
+
+                                if ok_retry and adj_qty > 0:
+                                    await human_sleep(self.config.after_click_sleep_ms)
+                                    add_btn_retry = await self.find_add_button(page)
+                                    if add_btn_retry:
+                                        await add_btn_retry.click(timeout=self.config.click_timeout)
+                                        await human_sleep((1500, 3000))
+                                        if await self.detector.is_cart_page(page):
+                                            return True, adj_qty, f"Успешно добавлено в корзину ({adj_qty} шт., скорректировано по лимиту {allowed_limit})"
+                                        return True, adj_qty, f"Зарезервировано ({adj_qty} шт., лимит {allowed_limit})"
+
+                        return False, 0, f"Лимит заказа: {alert_text}"
+        except Exception as alert_exc:
+            LOGGER.debug(f"Alert check exception: {alert_exc}")
 
         # Check if we arrived in cart / checkout
         if await self.detector.is_cart_page(page):

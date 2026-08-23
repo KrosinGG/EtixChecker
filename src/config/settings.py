@@ -175,6 +175,9 @@ class AppConfig:
 
     inventory_error_patterns: List[str] = field(
         default_factory=lambda: [
+            r"over the per order limit",
+            r"lead to over the per order limit",
+            r"per order limit",
             r"not enough tickets",
             r"not enough adjacent seats",
             r"not enough tickets of that type available",
@@ -182,6 +185,9 @@ class AppConfig:
             r"reduce the number of tickets and try again",
             r"\bPlease\s+reduce\b",
             r"\bChoose\s+fewer\b",
+            r"exceeds maximum allowed",
+            r"tickets are currently not available",
+            r"quantity requested is not available",
             r"Выберите меньше",
             r"уменьш",
         ]
