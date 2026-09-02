@@ -308,7 +308,11 @@ class EtixCartHandler:
         """
         control = await self.find_ticket_select(page, ticket_index)
         if not control:
-            return False, 0, "Dropdown/селектор выбора количества не найден"
+            # Fallback: wait 1.5s for dynamic React/MUI hydration and retry
+            await asyncio.sleep(1.5)
+            control = await self.find_ticket_select(page, ticket_index)
+            if not control:
+                return False, 0, "Dropdown/селектор выбора количества не найден"
 
         tag_name = await control.evaluate("el => el.tagName.toLowerCase()")
         if tag_name == "select":
@@ -325,7 +329,10 @@ class EtixCartHandler:
         # Find and click Add button
         add_btn = await self.find_add_button(page)
         if not add_btn:
-            return False, 0, "Кнопка 'Add Tickets / Add to Cart' не найдена"
+            await asyncio.sleep(1.0)
+            add_btn = await self.find_add_button(page)
+            if not add_btn:
+                return False, 0, "Кнопка 'Add Tickets / Add to Cart' не найдена"
 
         try:
             await add_btn.scroll_into_view_if_needed(timeout=2000)

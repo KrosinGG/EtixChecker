@@ -8,7 +8,7 @@ import queue
 import sys
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 import customtkinter as ctk
 import pandas as pd
@@ -22,6 +22,7 @@ from src.domain.enums import ShowStatus
 from src.domain.models import CheckResult, Show
 from src.etix.checker import EtixCheckEngine
 from src.utils.logger import LOGGER
+from src.utils.updater import UpdateService, VersionInfo
 
 # Configure appearance
 ctk.set_appearance_mode("dark")
@@ -59,9 +60,16 @@ STATUS_COLORS = {
 
 
 class ShowCardWidget(ctk.CTkFrame):
-    """Modern card item representing a single monitored event."""
+    """Modern card item representing a single monitored event with selection checkbox."""
 
-    def __init__(self, master, show: Show, **kwargs):
+    def __init__(
+        self,
+        master,
+        show: Show,
+        on_toggle: Optional[Callable[[], None]] = None,
+        initial_checked: bool = True,
+        **kwargs,
+    ):
         super().__init__(
             master,
             fg_color=COLOR_CARD_INNER,
@@ -71,12 +79,65 @@ class ShowCardWidget(ctk.CTkFrame):
             **kwargs,
         )
         self.show = show
+        self.on_toggle = on_toggle
+        self._is_checked = ctk.BooleanVar(value=initial_checked)
         self._build_card()
+        self._update_appearance()
+
+    @property
+    def is_selected(self) -> bool:
+        """Whether this show is marked for checking."""
+        return bool(self._is_checked.get())
+
+    def set_selected(self, val: bool, trigger_callback: bool = True) -> None:
+        """Programmatically set checkbox state."""
+        self._is_checked.set(val)
+        self._update_appearance()
+        if trigger_callback and self.on_toggle:
+            self.on_toggle()
+
+    def _on_check_changed(self) -> None:
+        """Internal callback when user clicks checkbox."""
+        self._update_appearance()
+        if self.on_toggle:
+            self.on_toggle()
+
+    def _update_appearance(self) -> None:
+        """Visually reflect enabled/disabled state of card."""
+        if self.is_selected:
+            self.configure(fg_color=COLOR_CARD_INNER, border_color="#263352")
+            if hasattr(self, "lbl_name"):
+                self.lbl_name.configure(text_color=COLOR_TEXT_PRIMARY)
+        else:
+            self.configure(fg_color="#0e1424", border_color="#182033")
+            if hasattr(self, "lbl_name"):
+                self.lbl_name.configure(text_color="#64748b")
 
     def _build_card(self):
+        # Far-left section: Selection Checkbox
+        self.chk_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.chk_frame.pack(side="left", padx=(14, 0), pady=10)
+
+        self.chk_select = ctk.CTkCheckBox(
+            self.chk_frame,
+            text="",
+            variable=self._is_checked,
+            width=22,
+            checkbox_width=20,
+            checkbox_height=20,
+            corner_radius=5,
+            border_width=2,
+            border_color="#475569",
+            fg_color=COLOR_BTN_PRIMARY,
+            hover_color=COLOR_BTN_PRIMARY_HOVER,
+            checkmark_color="#ffffff",
+            command=self._on_check_changed,
+        )
+        self.chk_select.pack(anchor="center")
+
         # Left section: Icon + Event info
         self.left_frame = ctk.CTkFrame(self, fg_color="transparent")
-        self.left_frame.pack(side="left", fill="both", expand=True, padx=14, pady=10)
+        self.left_frame.pack(side="left", fill="both", expand=True, padx=(8, 14), pady=10)
 
         title_frame = ctk.CTkFrame(self.left_frame, fg_color="transparent")
         title_frame.pack(fill="x", anchor="w")
@@ -207,6 +268,7 @@ class EtixGuiApp(ctk.CTk):
         self.client = AdsPowerClient(base_url=CONFIG.adspower_api_url)
         self.profile_manager = AdsPowerProfileManager(client=self.client)
         self.backup_service = ProfileBackupService()
+        self.update_service = UpdateService()
         self.show_cards: Dict[str, ShowCardWidget] = {}
 
         self._build_ui()
@@ -328,6 +390,9 @@ class EtixGuiApp(ctk.CTk):
         self.btn_logs = self._create_action_btn("📁  Логи", lambda: self._open_folder(CONFIG.logs_dir))
         self.btn_logs.pack(side="left", padx=6)
 
+        self.btn_updates = self._create_action_btn("🔄  Проверить обновления", self._on_check_updates_clicked)
+        self.btn_updates.pack(side="left", padx=6)
+
         # 4. Main Content Card with Tabs (Dashboard Cards vs Live Logs)
         self.main_card = ctk.CTkFrame(
             self,
@@ -354,6 +419,48 @@ class EtixGuiApp(ctk.CTk):
 
         self.tab_dashboard = self.tabview.add("📊  Панель мониторинга")
         self.tab_logs = self.tabview.add("📜  Журнал событий (Лог)")
+
+        # Quick Selection Bar
+        self.selection_bar = ctk.CTkFrame(self.tab_dashboard, fg_color="transparent")
+        self.selection_bar.pack(fill="x", padx=6, pady=(4, 6))
+
+        self.btn_select_all = ctk.CTkButton(
+            self.selection_bar,
+            text="✓  Выбрать все",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=11, weight="bold"),
+            fg_color="#1e293b",
+            hover_color="#334155",
+            border_color="#334155",
+            border_width=1,
+            text_color="#cbd5e1",
+            height=28,
+            corner_radius=6,
+            command=self._on_select_all_clicked,
+        )
+        self.btn_select_all.pack(side="left", padx=(0, 6))
+
+        self.btn_deselect_all = ctk.CTkButton(
+            self.selection_bar,
+            text="✕  Снять все",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=11, weight="bold"),
+            fg_color="#1e293b",
+            hover_color="#334155",
+            border_color="#334155",
+            border_width=1,
+            text_color="#94a3b8",
+            height=28,
+            corner_radius=6,
+            command=self._on_deselect_all_clicked,
+        )
+        self.btn_deselect_all.pack(side="left", padx=6)
+
+        self.lbl_selected_counter = ctk.CTkLabel(
+            self.selection_bar,
+            text="Выбрано: 0 из 0 событий",
+            font=ctk.CTkFont(family=FONT_FAMILY, size=11),
+            text_color=COLOR_TEXT_MUTED,
+        )
+        self.lbl_selected_counter.pack(side="right", padx=6)
 
         # Tab 1: Scrollable Show Cards
         self.scroll_shows = ctk.CTkScrollableFrame(
@@ -419,19 +526,21 @@ class EtixGuiApp(ctk.CTk):
         )
 
     def _load_shows_preview(self) -> None:
-        """Load shows from shows.csv and generate cards."""
+        """Load shows from shows.csv and generate cards, preserving selection state."""
+        existing_selection = {show_id: card.is_selected for show_id, card in self.show_cards.items()}
+
         for child in self.scroll_shows.winfo_children():
             child.destroy()
         self.show_cards.clear()
 
         engine = EtixCheckEngine(config=CONFIG)
         shows = engine.load_shows(CONFIG.shows_csv)
-        total_target = sum(s.target_total for s in shows)
-
-        self.stat_shows.lbl_val.configure(text=f"{len(shows)}")
-        self.stat_reserved.lbl_val.configure(text=f"0 / {total_target}")
 
         if not shows:
+            self.stat_shows.lbl_val.configure(text="0")
+            self.stat_reserved.lbl_val.configure(text="0 / 0")
+            if hasattr(self, "lbl_selected_counter"):
+                self.lbl_selected_counter.configure(text="Выбрано: 0 из 0 событий")
             empty_lbl = ctk.CTkLabel(
                 self.scroll_shows,
                 text="Файл shows.csv пуст или не содержит событий. Нажмите 'shows.csv' для добавления ссылок.",
@@ -442,9 +551,43 @@ class EtixGuiApp(ctk.CTk):
             return
 
         for s in shows:
-            card = ShowCardWidget(self.scroll_shows, show=s)
+            is_checked = existing_selection.get(s.show_id, True)
+            card = ShowCardWidget(
+                self.scroll_shows,
+                show=s,
+                on_toggle=self._update_selection_stats,
+                initial_checked=is_checked,
+            )
             card.pack(fill="x", pady=5)
             self.show_cards[s.show_id] = card
+
+        self._update_selection_stats()
+
+    def _update_selection_stats(self) -> None:
+        """Recalculate and update top metric chips based on checked shows."""
+        selected_cards = [c for c in self.show_cards.values() if c.is_selected]
+        total_count = len(self.show_cards)
+        selected_count = len(selected_cards)
+        selected_target = sum(c.show.target_total for c in selected_cards)
+
+        self.stat_shows.lbl_val.configure(text=f"{selected_count} из {total_count}")
+        self.stat_reserved.lbl_val.configure(text=f"0 / {selected_target}")
+        if hasattr(self, "lbl_selected_counter"):
+            self.lbl_selected_counter.configure(
+                text=f"Выбрано: {selected_count} из {total_count} событий"
+            )
+
+    def _on_select_all_clicked(self) -> None:
+        """Select all shows."""
+        for card in self.show_cards.values():
+            card.set_selected(True, trigger_callback=False)
+        self._update_selection_stats()
+
+    def _on_deselect_all_clicked(self) -> None:
+        """Deselect all shows."""
+        for card in self.show_cards.values():
+            card.set_selected(False, trigger_callback=False)
+        self._update_selection_stats()
 
     def _log(self, text: str) -> None:
         self.txt_log.insert("end", text + "\n")
@@ -504,14 +647,30 @@ class EtixGuiApp(ctk.CTk):
         if self.is_running:
             return
 
+        selected_cards = [c for c in self.show_cards.values() if c.is_selected]
+        if not selected_cards:
+            messagebox.showwarning(
+                "Нет выбранных событий",
+                "Пожалуйста, выберите хотя бы одно событие галочкой для запуска проверки.",
+            )
+            return
+
         self.is_running = True
         self.btn_start.configure(state="disabled", text="⏳  Проверка выполняется...")
         self.stat_status.lbl_val.configure(text="Выполняется...", text_color="#f59e0b")
         self._log("=========================================")
-        self._log("🚀 Запуск процесса проверки Etix (AdsPower CDP)...")
+        self._log(
+            f"🚀 Запуск процесса проверки Etix (AdsPower CDP) для {len(selected_cards)} выбранных событий..."
+        )
 
-        # Reload cards to reset pending state
-        self._load_shows_preview()
+        # Reset state only for selected cards
+        for card in selected_cards:
+            card.lbl_status.configure(text="PENDING", text_color="#94a3b8", fg_color="#1e293b")
+            card.lbl_count.configure(text=f"0 / {card.show.target_total}", text_color=COLOR_TEXT_MUTED)
+            card.progress_bar.configure(progress_color="#6366f1")
+            card.progress_bar.set(0.0)
+
+        selected_shows = [c.show for c in selected_cards]
 
         def worker():
             async def run():
@@ -527,12 +686,39 @@ class EtixGuiApp(ctk.CTk):
                 try:
                     results = await engine.run(
                         shows_csv=CONFIG.shows_csv,
+                        shows=selected_shows,
                         resume=True,
                         on_show_done=on_done,
                     )
                     self.event_queue.put(("check_completed", results))
                 except Exception as exc:
                     self.event_queue.put(("check_failed", str(exc)))
+
+            asyncio.run(run())
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_check_updates_clicked(self) -> None:
+        self.btn_updates.configure(state="disabled", text="⏳  Проверка...")
+        self._log("🔍 Проверка наличия обновлений на GitHub...")
+
+        def worker():
+            async def run():
+                has_update, version_info, err = await self.update_service.check_for_updates()
+                self.event_queue.put(("update_check_result", has_update, version_info, err))
+
+            asyncio.run(run())
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _start_update_download(self, version_info: Optional[VersionInfo]) -> None:
+        self.btn_updates.configure(state="disabled", text="⏳  Обновление...")
+        self._log("⬇️ Скачивание и применение обновления...")
+
+        def worker():
+            async def run():
+                ok, msg = await self.update_service.apply_update(remote_version=version_info)
+                self.event_queue.put(("update_applied", ok, msg))
 
             asyncio.run(run())
 
@@ -559,6 +745,42 @@ class EtixGuiApp(ctk.CTk):
                         self._log(f"💾 Создан бэкап метаданных: {path_or_err}")
                     else:
                         messagebox.showerror("Ошибка бэкапа", f"Не удалось создать бэкап: {path_or_err}")
+
+                elif kind == "update_check_result":
+                    self.btn_updates.configure(state="normal", text="🔄  Проверить обновления")
+                    has_update, version_info, err = msg[1], msg[2], msg[3]
+                    if err:
+                        self._log(f"❌ Ошибка проверки обновлений: {err}")
+                        messagebox.showerror("Проверка обновлений", f"Не удалось проверить обновления:\n{err}")
+                    elif not has_update:
+                        local_ver = self.update_service.get_local_version()
+                        ver_str = f"коммит {local_ver.short_sha}" if local_ver else "актуальная"
+                        date_str = f" от {local_ver.date}" if local_ver and local_ver.date else ""
+                        self._log(f"✅ У вас установлена актуальная версия ({ver_str}{date_str}).")
+                        messagebox.showinfo("Обновления", f"У вас установлена самая свежая версия программы ({ver_str}{date_str})!")
+                    else:
+                        assert version_info is not None
+                        self._log(f"🎉 Найдено обновление: {version_info.short_sha} — {version_info.message}")
+                        update_prompt = (
+                            f"🎉 Доступна новая версия программы!\n\n"
+                            f"Коммит: {version_info.short_sha}\n"
+                            f"Дата: {version_info.date}\n"
+                            f"Описание: {version_info.message}\n\n"
+                            f"⚠️ Пользовательские настройки (.env, shows.csv, прокси) будут сохранены.\n\n"
+                            f"Обновить программу прямо сейчас в 1 клик?"
+                        )
+                        if messagebox.askyesno("Доступно обновление", update_prompt):
+                            self._start_update_download(version_info)
+
+                elif kind == "update_applied":
+                    self.btn_updates.configure(state="normal", text="🔄  Проверить обновления")
+                    ok, res_msg = msg[1], msg[2]
+                    if ok:
+                        self._log(f"🎉 {res_msg}")
+                        messagebox.showinfo("Обновление завершено", f"{res_msg}\n\nПожалуйста, перезапустите программу для вступления изменений в силу.")
+                    else:
+                        self._log(f"❌ Ошибка обновления: {res_msg}")
+                        messagebox.showerror("Ошибка обновления", res_msg)
 
                 elif kind == "show_done":
                     res: CheckResult = msg[1]

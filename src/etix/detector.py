@@ -104,25 +104,88 @@ class EtixDetector:
         return False
 
     async def is_blocked_page(self, page: Page) -> bool:
-        """Check whether DataDome returned 'Access Temporarily Blocked'."""
+        """Check whether DataDome returned 'Access Temporarily Blocked' in main page or any iframe."""
         try:
-            body_text = await page.inner_text("body", timeout=1500)
+            # Check page title first
+            title = await page.title()
             for pattern in self.config.blocked_text_patterns:
-                if re.search(pattern, body_text, flags=re.I):
+                if re.search(pattern, title, flags=re.I):
                     return True
         except Exception:
             pass
+
+        # Check all frames (main page + iframes)
+        for frame in page.frames:
+            try:
+                body_text = await frame.inner_text("body", timeout=800)
+                for pattern in self.config.blocked_text_patterns:
+                    if re.search(pattern, body_text, flags=re.I):
+                        return True
+            except Exception:
+                continue
         return False
 
     async def is_slider_captcha(self, page: Page) -> bool:
-        """Check whether DataDome displayed the 'Slide right to secure your access' slider."""
-        try:
-            body_text = await page.inner_text("body", timeout=1500)
-            for pattern in self.config.slider_captcha_patterns:
-                if re.search(pattern, body_text, flags=re.I):
+        """
+        Check whether DataDome displayed the slider challenge in the main frame,
+        nested iframes (e.g. captcha-delivery.com), or shadow roots.
+        """
+        # 1. Quick check: presence of DataDome captcha iframe in page.frames
+        for frame in page.frames:
+            try:
+                f_url = (frame.url or "").lower()
+                if "captcha-delivery.com" in f_url or "datadome.co" in f_url:
                     return True
+            except Exception:
+                continue
+
+        # 2. Check for explicit DataDome iframe element in DOM
+        try:
+            cpt_iframe = page.locator("iframe[src*='captcha-delivery.com'], iframe[src*='datadome'], iframe[title*='DataDome']").first
+            if await cpt_iframe.is_visible(timeout=500):
+                return True
         except Exception:
             pass
+
+        # 3. Text patterns check across all frames
+        for frame in page.frames:
+            try:
+                body_text = await frame.inner_text("body", timeout=800)
+                for pattern in self.config.slider_captcha_patterns:
+                    if re.search(pattern, body_text, flags=re.I):
+                        return True
+            except Exception:
+                continue
+
+        # 4. Visible slider handle selectors check across all frames
+        slider_selectors = [
+            "[role='slider']",
+            ".slider-button",
+            "#sec-slider",
+            ".sec-slider-btn",
+            ".slider",
+            ".geetest_slider_button",
+            "#sec-slider-btn",
+            ".captcha-slider-btn",
+            "div.sliderBtn",
+            "#slider",
+            ".tc-slider-normal",
+        ]
+        for sel in slider_selectors:
+            try:
+                loc = page.locator(sel).first
+                if await loc.is_visible(timeout=300):
+                    return True
+            except Exception:
+                continue
+            for frame in page.frames:
+                try:
+                    f_loc = frame.locator(sel).first
+                    if await f_loc.is_visible(timeout=300):
+                        return True
+                except Exception:
+                    continue
+
         return False
 
     def is_inventory_message(self, text: str) -> bool:

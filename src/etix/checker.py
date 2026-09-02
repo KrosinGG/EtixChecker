@@ -116,11 +116,13 @@ class EtixCheckEngine:
     async def run(
         self,
         shows_csv: Path = Path("data/shows.csv"),
+        shows: Optional[List[Show]] = None,
         resume: bool = True,
         on_show_done: CallbackType = None,
     ) -> List[CheckResult]:
-        """Execute full checking pipeline across all loaded shows."""
-        shows = self.load_shows(shows_csv)
+        """Execute full checking pipeline across all loaded shows (or specific selected shows)."""
+        if shows is None:
+            shows = self.load_shows(shows_csv)
         if not shows:
             return []
 
@@ -352,38 +354,41 @@ class EtixCheckEngine:
             f"(Target: {show.target_total}, Max/Order: {effective_max_per_order}, Needed workers: {required_workers_count})"
         )
 
-        # Step 6: Staggered URL navigation in remaining needed workers
-        nav_tasks = []
+        # Step 6: Strict Readiness Barrier across all selected workers
+        LOGGER.info(
+            f"Entering Readiness Barrier for {len(selected_workers)} workers on '{show.name}'..."
+        )
+        ready_tasks = []
         accumulated_nav_delay = 0.0
-        nav_worker_list: List[BrowserWorker] = []
         for w in selected_workers:
-            if w == primary_worker:
-                continue
-            accumulated_nav_delay += random.uniform(
-                self.config.batch_nav_delay_ms[0], self.config.batch_nav_delay_ms[1]
-            ) / 1000.0
-            nav_worker_list.append(w)
-            nav_tasks.append(
-                self._open_and_prep_page(w.page, show.url, w.worker_index, delay_s=accumulated_nav_delay)
+            # Primary worker was pre-loaded in Step 1, so no initial delay needed
+            delay = 0.0 if w == primary_worker else accumulated_nav_delay
+            if w != primary_worker:
+                accumulated_nav_delay += random.uniform(
+                    self.config.batch_nav_delay_ms[0], self.config.batch_nav_delay_ms[1]
+                ) / 1000.0
+            ready_tasks.append(
+                self._ensure_worker_ready_for_show(w, show, initial_delay_s=delay)
             )
 
-        if nav_tasks:
-            nav_results = await asyncio.gather(*nav_tasks, return_exceptions=True)
-            for idx, res in enumerate(nav_results):
-                w = nav_worker_list[idx]
-                if isinstance(res, Exception) or res is False:
-                    LOGGER.warning(f"[Worker #{w.worker_index}] Navigation prep returned error/false: {res}")
+        ready_results = await asyncio.gather(*ready_tasks, return_exceptions=True)
 
-        # Verify each worker accessibility (slider/block/url) before adding to cart
         verified_workers: List[BrowserWorker] = []
         excluded_details: List[str] = []
-        for w in selected_workers:
-            ready_w = await self._ensure_worker_accessible(w, show)
-            if ready_w:
-                verified_workers.append(ready_w)
+        for idx, res in enumerate(ready_results):
+            original_worker = selected_workers[idx]
+            if isinstance(res, BrowserWorker) and res is not None:
+                verified_workers.append(res)
+            elif isinstance(res, Exception):
+                LOGGER.error(f"[Worker #{original_worker.worker_index}] Readiness check raised exception: {res}")
+                excluded_details.append(f"[Worker #{original_worker.worker_index}] Ошибка готовности: {res}")
             else:
-                LOGGER.warning(f"[Worker #{w.worker_index}] Excluded from cart addition due to unrecovered block or dead proxy.")
-                excluded_details.append(f"[Worker #{w.worker_index}] Не удалось открыть/разблокировать страницу")
+                LOGGER.warning(f"[Worker #{original_worker.worker_index}] Excluded: did not reach ready state on {show.url}")
+                excluded_details.append(f"[Worker #{original_worker.worker_index}] Страница не открыта")
+
+        LOGGER.info(
+            f"Readiness Barrier complete: {len(verified_workers)}/{len(selected_workers)} workers confirmed READY on {show.url}"
+        )
 
         selected_workers = verified_workers
         if not selected_workers:
@@ -394,10 +399,10 @@ class EtixCheckEngine:
                 status=ShowStatus.BLOCKED,
                 target=show.target_total,
                 reserved=0,
-                details="Все задействованные профили заблокированы DataDome или недоступны.",
+                details="Все задействованные профили не смогли открыть страницу события или заблокированы.",
             )
 
-        # Step 7: Staggered addition to cart across selected workers
+        # Step 7: Staggered addition to cart across verified workers
         cart_tasks = []
         remaining_to_reserve = show.target_total
         accumulated_add_delay = 0.0
@@ -521,124 +526,202 @@ class EtixCheckEngine:
 
         await self.cart_handler.clear_cart(worker.page)
 
-    async def _open_and_prep_page(
+    async def _ensure_worker_ready_for_show(
         self,
-        page: Any,
-        url: str,
-        worker_index: int,
-        delay_s: float = 0.0,
-    ) -> bool:
-        """Helper to navigate worker page to URL with incremental stagger."""
-        try:
-            if delay_s > 0:
-                await asyncio.sleep(delay_s)
-            else:
-                await human_sleep(self.config.batch_nav_delay_ms)
+        worker: BrowserWorker,
+        show: Show,
+        initial_delay_s: float = 0.0,
+        max_retries: int = 3,
+    ) -> Optional[BrowserWorker]:
+        """
+        Guarantees that a worker successfully opens the target show URL,
+        passes bot challenges, dismisses popups, and confirms the page is ready for carting.
+        Includes multi-attempt retry loop and automatic hot-swap fallback.
+        """
+        if initial_delay_s > 0:
+            await asyncio.sleep(initial_delay_s)
 
-            LOGGER.info(f"[Worker #{worker_index}] Opening URL: {url}")
-            await page.goto(url, wait_until="domcontentloaded", timeout=self.config.nav_timeout)
-            await accept_cookies_if_present(page)
-            await close_blocking_popups(page)
+        current_worker = worker
+        target_path = show.url.split("?")[0].rstrip("/")
 
-            if await self.detector.is_bad_proxy_page(page):
-                LOGGER.warning(f"[Worker #{worker_index}] Proxy connection failed: Chrome error page detected.")
-                return False
-
+        for attempt in range(1, max_retries + 1):
             try:
-                await page.wait_for_selector(
-                    "select, [role='combobox'], .MuiSelect-select, button:has-text('Add Tickets'), input[value*='Add Tickets']",
-                    timeout=12000,
+                # 1. Check if page is valid / not closed
+                try:
+                    if current_worker.page.is_closed():
+                        current_worker.page = await current_worker.context.new_page()
+                        current_worker.page.set_default_navigation_timeout(self.config.nav_timeout)
+                        current_worker.page.set_default_timeout(self.config.click_timeout)
+                except Exception:
+                    pass
+
+                try:
+                    await current_worker.page.bring_to_front()
+                except Exception:
+                    pass
+
+                # 2. Check if current URL needs navigation
+                curr_url = (current_worker.page.url or "").strip()
+                needs_nav = (
+                    not curr_url
+                    or curr_url == "about:blank"
+                    or "chrome-error://" in curr_url
+                    or "chrome://" in curr_url
+                    or "start.adspower.net" in curr_url
+                    or target_path not in curr_url
                 )
-            except Exception:
-                pass
-            return True
-        except Exception as exc:
-            LOGGER.warning(f"[Worker #{worker_index}] Open URL failed ({exc})")
-            return False
+
+                if needs_nav:
+                    LOGGER.info(
+                        f"[Worker #{current_worker.worker_index}] (Attempt {attempt}/{max_retries}) Navigating to {show.url}..."
+                    )
+                    try:
+                        await current_worker.page.goto(
+                            show.url,
+                            wait_until="domcontentloaded",
+                            timeout=self.config.nav_timeout,
+                        )
+                        await human_sleep((400, 800))
+                        await accept_cookies_if_present(current_worker.page)
+                        await close_blocking_popups(current_worker.page)
+                    except Exception as nav_exc:
+                        LOGGER.warning(
+                            f"[Worker #{current_worker.worker_index}] Navigation failed on attempt {attempt}: {nav_exc}"
+                        )
+
+                # 3. Check for Bad Proxy page
+                if await self.detector.is_bad_proxy_page(current_worker.page):
+                    LOGGER.warning(
+                        f"[Worker #{current_worker.worker_index}] Chrome network error / bad proxy on attempt {attempt}."
+                    )
+                    if self.cdp_pool:
+                        new_w = await self.cdp_pool.replace_worker_with_reserve(
+                            current_worker, reason="Bad proxy connection error"
+                        )
+                        if new_w:
+                            current_worker = new_w
+                            continue
+
+                # 4. Check for DataDome slider & block
+                if await self.detector.is_slider_captcha(current_worker.page):
+                    LOGGER.info(f"[Worker #{current_worker.worker_index}] DataDome slider detected. Solving...")
+                    solved = await solve_datadome_slider(current_worker.page)
+                    if (
+                        solved
+                        and not await self.detector.is_blocked_page(current_worker.page)
+                        and not await self.detector.is_slider_captcha(current_worker.page)
+                    ):
+                        LOGGER.info(f"[Worker #{current_worker.worker_index}] DataDome slider solved!")
+                        # If page hasn't auto-redirected or is still showing challenge URL, navigate to target event
+                        curr_u = (current_worker.page.url or "").lower()
+                        if "captcha-delivery" in curr_u or "datadome" in curr_u or target_path not in curr_u:
+                            LOGGER.info(f"[Worker #{current_worker.worker_index}] Navigating back to event URL {show.url} after solving captcha...")
+                            try:
+                                await current_worker.page.goto(
+                                    show.url,
+                                    wait_until="domcontentloaded",
+                                    timeout=self.config.nav_timeout,
+                                )
+                                await human_sleep((400, 800))
+                                await accept_cookies_if_present(current_worker.page)
+                                await close_blocking_popups(current_worker.page)
+                            except Exception as re_nav_err:
+                                LOGGER.warning(f"[Worker #{current_worker.worker_index}] Post-captcha navigation warning: {re_nav_err}")
+
+                if (
+                    await self.detector.is_blocked_page(current_worker.page)
+                    or await self.detector.is_slider_captcha(current_worker.page)
+                ):
+                    LOGGER.warning(
+                        f"[Worker #{current_worker.worker_index}] DataDome active. Resetting cookies and retrying..."
+                    )
+                    try:
+                        await current_worker.context.clear_cookies()
+                        await human_sleep((600, 1200))
+                        await current_worker.page.goto(
+                            show.url,
+                            wait_until="domcontentloaded",
+                            timeout=self.config.nav_timeout,
+                        )
+                        await accept_cookies_if_present(current_worker.page)
+                        await close_blocking_popups(current_worker.page)
+                    except Exception:
+                        pass
+
+                    if (
+                        await self.detector.is_blocked_page(current_worker.page)
+                        or await self.detector.is_slider_captcha(current_worker.page)
+                    ):
+                        LOGGER.info(
+                            f"[Worker #{current_worker.worker_index}] DataDome still blocked. Initiating Hot-Swap..."
+                        )
+                        if self.cdp_pool:
+                            new_w = await self.cdp_pool.replace_worker_with_reserve(
+                                current_worker, reason="DataDome block unrecovered"
+                            )
+                            if new_w:
+                                current_worker = new_w
+                                continue
+
+                # 5. Check if page reached Sold Out or Sales Ended
+                if (
+                    await self.detector.is_soldout_page(current_worker.page)
+                    or await self.detector.is_event_ended_page(current_worker.page)
+                ):
+                    LOGGER.info(
+                        f"[Worker #{current_worker.worker_index}] Event is Sold Out or Ended on {show.url}."
+                    )
+                    return current_worker
+
+                # 6. Verify Ticket Controls & DOM Readiness
+                try:
+                    await current_worker.page.wait_for_selector(
+                        ".smoketest-ticket-quantity, [role='combobox'], .MuiSelect-select, select, button:has-text('Add Tickets'), input[value*='Add Tickets'], div[role='alert']",
+                        timeout=8000,
+                    )
+                except Exception:
+                    pass
+
+                controls = await self.cart_handler.get_all_quantity_controls(current_worker.page)
+                add_btn = await self.cart_handler.find_add_button(current_worker.page)
+
+                if controls or add_btn:
+                    LOGGER.info(
+                        f"[Worker #{current_worker.worker_index}] Verified READY on {show.url} (Found {len(controls)} controls)"
+                    )
+                    return current_worker
+
+                # If we're on the target URL or etix.com but controls are not yet ready, reload on next attempt
+                curr_url = current_worker.page.url or ""
+                if "etix.com" in curr_url:
+                    LOGGER.warning(
+                        f"[Worker #{current_worker.worker_index}] URL is open but controls not rendered (attempt {attempt}/{max_retries}). Reloading..."
+                    )
+                    try:
+                        await current_worker.page.reload(
+                            wait_until="domcontentloaded",
+                            timeout=self.config.nav_timeout,
+                        )
+                        await human_sleep((500, 1000))
+                        await accept_cookies_if_present(current_worker.page)
+                        await close_blocking_popups(current_worker.page)
+                    except Exception:
+                        pass
+
+            except Exception as exc:
+                LOGGER.warning(
+                    f"[Worker #{current_worker.worker_index}] Readiness check error (attempt {attempt}/{max_retries}): {exc}"
+                )
+
+        LOGGER.error(
+            f"[Worker #{current_worker.worker_index}] Failed to confirm readiness on {show.url} after {max_retries} attempts."
+        )
+        return None
 
     async def _ensure_worker_accessible(
         self,
         worker: BrowserWorker,
         show: Show,
     ) -> Optional[BrowserWorker]:
-        """
-        Check if worker is facing DataDome slider, block, or dead proxy, and execute 3-step recovery:
-        1. Humanized Drag & Drop of slider
-        2. context.clear_cookies() + fresh tab reload
-        3. Hot-Swap with reserve profile configured with clean good proxy
-        """
-        # Ensure page is actually on the target URL (not about:blank or error page)
-        current_url = worker.page.url or ""
-        if not current_url or current_url == "about:blank" or "chrome-error://" in current_url:
-            LOGGER.info(f"[Worker #{worker.worker_index}] Page not loaded (url='{current_url}'). Loading {show.url}...")
-            try:
-                await worker.page.goto(show.url, wait_until="domcontentloaded", timeout=self.config.nav_timeout)
-                await accept_cookies_if_present(worker.page)
-                await close_blocking_popups(worker.page)
-            except Exception as exc:
-                LOGGER.warning(f"[Worker #{worker.worker_index}] Navigation attempt failed: {exc}")
-
-        is_bad_proxy = await self.detector.is_bad_proxy_page(worker.page)
-        is_blocked = await self.detector.is_blocked_page(worker.page)
-        is_slider = await self.detector.is_slider_captcha(worker.page)
-
-        if not is_blocked and not is_slider and not is_bad_proxy:
-            # Check if page has ticket controls or matches target URL
-            controls = await self.cart_handler.get_all_quantity_controls(worker.page)
-            add_btn = await self.cart_handler.find_add_button(worker.page)
-            if controls or add_btn or ("etix.com" in (worker.page.url or "")):
-                return worker
-
-        LOGGER.warning(
-            f"[Worker #{worker.worker_index}] Challenge/Issue detected (slider={is_slider}, blocked={is_blocked}, bad_proxy={is_bad_proxy}). Starting recovery..."
-        )
-
-        # Stage 1: Fast Humanized Drag & Drop if slider is present
-        if is_slider:
-            LOGGER.info(f"[Worker #{worker.worker_index}] Step 1: Trying humanized slider drag...")
-            solved = await solve_datadome_slider(worker.page)
-            if solved and not await self.detector.is_blocked_page(worker.page) and not await self.detector.is_slider_captcha(worker.page):
-                LOGGER.info(f"[Worker #{worker.worker_index}] Slider successfully solved on Step 1!")
-                return worker
-
-        # Stage 2: Clear cookies via CDP and reload in a fresh tab (if not dead proxy)
-        if not is_bad_proxy:
-            LOGGER.info(f"[Worker #{worker.worker_index}] Step 2: Clearing cookies and reopening in fresh tab...")
-            try:
-                await worker.context.clear_cookies()
-                old_page = worker.page
-                new_page = await worker.context.new_page()
-                new_page.set_default_navigation_timeout(self.config.nav_timeout)
-                new_page.set_default_timeout(self.config.click_timeout)
-                worker.page = new_page
-                try:
-                    await old_page.close()
-                except Exception:
-                    pass
-
-                await human_sleep((1000, 2000))
-                await worker.page.goto(show.url, wait_until="domcontentloaded", timeout=self.config.nav_timeout)
-                await accept_cookies_if_present(worker.page)
-                await close_blocking_popups(worker.page)
-
-                if not await self.detector.is_blocked_page(worker.page) and not await self.detector.is_slider_captcha(worker.page) and not await self.detector.is_bad_proxy_page(worker.page):
-                    LOGGER.info(f"[Worker #{worker.worker_index}] Successfully unblocked on Step 2 (cookie reset)!")
-                    return worker
-            except Exception as exc:
-                LOGGER.warning(f"[Worker #{worker.worker_index}] Step 2 error: {exc}")
-
-        # Stage 3: Hot-Swap on reserve profile with clean good proxy
-        LOGGER.info(f"[Worker #{worker.worker_index}] Step 3: Performing Hot-Swap to reserve profile with good proxy...")
-        if self.cdp_pool:
-            new_worker = await self.cdp_pool.replace_worker_with_reserve(
-                failing_worker=worker,
-                reason="DataDome / Bad proxy challenge unrecovered",
-            )
-            if new_worker:
-                ok = await self._open_and_prep_page(new_worker.page, show.url, new_worker.worker_index)
-                if ok and not await self.detector.is_blocked_page(new_worker.page) and not await self.detector.is_slider_captcha(new_worker.page):
-                    LOGGER.info(f"[Worker #{new_worker.worker_index}] Hot-swap successful! Proceeding on new profile.")
-                    return new_worker
-
-        LOGGER.error(f"[Worker #{worker.worker_index}] All recovery steps exhausted.")
-        return None
+        """Backwards-compatible wrapper around _ensure_worker_ready_for_show."""
+        return await self._ensure_worker_ready_for_show(worker, show, initial_delay_s=0.0)

@@ -119,7 +119,25 @@ class CDPBrowserPool:
             )
 
             context = browser.contexts[0] if browser.contexts else await browser.new_context()
-            page = context.pages[0] if context.pages else await context.new_page()
+            
+            # Tab sanitization: ensure single active clean page
+            pages = context.pages
+            if not pages:
+                page = await context.new_page()
+            else:
+                page = pages[0]
+                # If AdsPower opened extra blank or start tabs, close them gracefully
+                if len(pages) > 1:
+                    for extra_page in pages[1:]:
+                        try:
+                            await extra_page.close()
+                        except Exception:
+                            pass
+
+            try:
+                await page.bring_to_front()
+            except Exception:
+                pass
 
             page.set_default_navigation_timeout(self.config.nav_timeout)
             page.set_default_timeout(self.config.click_timeout)

@@ -111,11 +111,48 @@ async def run_all_tests():
     print("  [+] Profile Manager & Backup Service verified.")
 
     # Test 6: Reporter
-    print("[6/6] Testing Reporter...")
+    print("[6/7] Testing Reporter...")
     reporter = Reporter()
     test_report_path = reporter.save_report([result])
     assert test_report_path.exists()
     print("  [+] Reporter verified.")
+
+    # Test 7: UpdateService
+    print("[7/9] Testing UpdateService...")
+    from src.utils.updater import UpdateService
+    updater = UpdateService()
+    assert updater._is_path_protected(".env")
+    assert updater._is_path_protected("data/shows.csv")
+    assert updater._is_path_protected("src/etix/checker.py") is False
+    local_ver = updater.get_local_version()
+    print(f"  Detected local version: {local_ver.short_sha if local_ver else 'None'}")
+    print("  [+] UpdateService verified.")
+
+    # Test 8: Bezier Curve & Human Motion Physics
+    print("[8/9] Testing Bezier curve & human motion kinematics...")
+    from src.browser.human_actions import _generate_bezier_points
+    start_x, start_y = 100.0, 200.0
+    end_x, end_y = 380.0, 200.0
+    points = _generate_bezier_points(start_x, start_y, end_x, end_y, steps=30)
+    assert len(points) == 30, f"Expected 30 points, got {len(points)}"
+    first_pt = points[0]
+    last_pt = points[-1]
+    assert first_pt[0] > start_x, "First step should advance along X"
+    assert abs(last_pt[0] - end_x) < 1.0, f"Last point X {last_pt[0]} should reach end_x {end_x}"
+    # Verify Y tremor jitter exists in middle trajectory
+    y_jitters = [abs(p[1] - start_y) for p in points[5:25]]
+    assert any(j > 0.05 for j in y_jitters), "Human Y micro-jitter not detected in middle trajectory"
+    print("  [+] Bezier kinematics & micro-jitter verified.")
+
+    # Test 9: Selective Shows Filtering in CheckEngine
+    print("[9/9] Testing selective shows filtering...")
+    assert len(shows) >= 1, "Need at least 1 show to test selection"
+    selected_subset = [shows[0]]
+    sub_ctx = RunContext(shows=selected_subset, run_id="subset_test")
+    assert len(sub_ctx.pending_ids) == 1
+    assert sub_ctx.pending_ids[0] == shows[0].show_id
+    sub_ctx.complete_run()
+    print("  [+] Selective shows filtering verified.")
 
     print("==================================================")
     print("[SUCCESS] ALL TESTS PASSED!")
